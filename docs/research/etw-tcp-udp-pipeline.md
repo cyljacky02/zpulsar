@@ -75,6 +75,10 @@ Accounting rule: `sent[PID] += size` on 10/26/42/58; `recv[PID] += size` on 11/2
 ignore 14/30 (retransmit) and 18/34 (protocol copy) for totals; use 12/15/13 (and v6
 28/31/29) plus the cold-start snapshot to maintain the connection list.
 
+Orientation rule (**not** uniform — see §2.5): `saddr`/`sport` are the local endpoint for
+every event **except UDP receive (43/59)**, where the payload describes the arriving
+datagram and the local endpoint is `daddr`/`dport`.
+
 ---
 
 ## 1. Provider comparison
@@ -139,7 +143,9 @@ logger flavor ([TcpIp_TypeGroup1][tg1]: `PID(WmiDataId 1), size(2), daddr(3), sa
 dport(5), sport(6), seqnum(7), connid(8)`; [UdpIp_TypeGroup1][utg1] identical), and with the
 event-ID mapping in Microsoft's TraceEvent parser ([KernelTraceEventParser.cs][traceevent]).
 All events are version 0 — this schema has been stable since Vista; the engine should still
-assert version and fail over to TDH-computed offsets (§3.2).
+assert version and fail over to TDH-computed offsets (§3.2). The manifest is authoritative
+for field *names, widths and order* only: it does not say which of `daddr`/`saddr` is the
+local endpoint, and its message text is actively misleading there (§2.5).
 
 ### 2.2 `size` semantics
 
@@ -168,6 +174,65 @@ big-endian in the raw payload — `ntohs` before display/compare. `daddr`/`saddr
 `in_addr` / 16-byte `in6_addr` network-order values. The same convention holds for the
 iphlpapi snapshot rows ("The dwLocalPort … in network byte order" — [MIB_TCPROW_OWNER_PID][tcprow],
 [MIB_UDPROW_OWNER_PID][udprow]), so the flow-table key normalization is shared.
+
+### 2.5 Orientation: which of `daddr`/`saddr` is the local endpoint
+
+Added 2026-08-15 for [#36](https://github.com/cyljacky02/zpulsar/issues/36); the original
+ticket assumed a single global orientation, which is wrong for UDP receive.
+
+**The manifest cannot answer this.** Every data event's message template is
+`"%2 bytes transmitted/received from %4:%6 to %3:%5"` — that is `saddr:sport` → `daddr:dport`
+— for *all* of 10/11/26/27/42/43/58/59. The same packet-oriented phrasing is used for send
+and receive alike, so it neither distinguishes the two nor survives checking: it is
+demonstrably wrong for TCP receive (below). Only a controlled live trace settles it.
+
+**Method.** Elevated `logman` file session on the provider (keywords `0x30`, level 4),
+traffic generated from a known PID with known local ports, then the ETL's event records
+decoded directly against the §Verdict layout — `tracerpt` and `Get-WinEvent` both decline to
+decode this provider's templates and silently emit only the session header, so neither can
+be used to check payloads. Three runs: real-internet IPv4 (UDP to `8.8.8.8:53`, TCP to
+`1.1.1.1:80`), and IPv4 + IPv6 loopback socket pairs where each datagram's sending and
+receiving socket are both known.
+
+**Result.**
+
+| ids | orientation | local endpoint is |
+|---|---|---|
+| 10, 11, 12, 13, 15, 26, 27, 28, 29, 31 (all TCP) | endpoint-oriented | `saddr`/`sport` |
+| 42, 58 (UDP send) | endpoint-oriented | `saddr`/`sport` |
+| **43, 59 (UDP receive)** | **packet-oriented** | **`daddr`/`dport`** |
+
+The discriminator is what a single datagram/segment looks like from both ends:
+
+- **UDP.** The send event and the receive event for the *same* datagram carry byte-identical
+  `saddr`/`daddr`. That is only possible if both describe the datagram rather than either
+  socket — so on the receiving side `saddr` is the sender, i.e. the remote. Loopback pair
+  `::1:60110 → ::1:60109`: id 58 and id 59 both report `saddr=:60110, daddr=:60109`, and the
+  receiving socket is `:60109`.
+- **TCP.** The send and the matching receive on one socket carry the *same* `saddr` = that
+  socket's own local address, and the two ends of the connection report mirrored tuples.
+  tcpip.sys logs against the TCB, which knows local and remote regardless of direction.
+  Loopback pair: client `:53791` reports `saddr=:53791` on both its send (26) and its
+  receive (27); server `:53790` reports `saddr=:53790` on both of its own.
+
+So the #20 verification was correct for TCP and not an artefact of a symmetric echo pair —
+but it was TCP-only, and generalizing it to UDP split every UDP conversation into two
+Flows with mirrored endpoints (#36).
+
+Consequence for parsing: orientation is a property of the (event id, direction) pair, not of
+the provider. `parser.zig` encodes it once in `Class.orientation` and applies it through
+`assignEndpoints`, which the TDH fallback shares so the two paths cannot disagree.
+
+**Nuance — broadcast and multicast receives.** Because a UDP receive reports the datagram's
+own destination, a datagram addressed to a broadcast or multicast group yields that group as
+the Flow's local endpoint (e.g. `192.168.88.255:57621`, `224.0.0.252:5355`) rather than a
+unicast address the socket could have bound. There is no better answer available: the
+payload carries no field for the receiving interface's unicast address, so anything else
+would be invented. The remote side — the only side Hostname Attribution keys on — is the
+actual sender, which is what matters. A consequence is that a process broadcasting and
+hearing its own datagram shows two Flows (`us → group` for the send, `group → us` for the
+receive); those are genuinely different endpoint pairs, not the #36 mirroring, which
+affected ordinary unicast conversations.
 
 ## 3. Real-time consumer mechanics
 
