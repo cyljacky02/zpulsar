@@ -17,8 +17,13 @@ Three structurally different layouts on the same live fake data. Switch with the
 bottom bar (◂ ▸ buttons) or ←/→ arrow keys (note: arrows are captured by a table once you've
 clicked into it — a real conflict to decide on):
 
-- **A — Ledger**: one dense sortable table (NetLimiter-style). Click a process row to expand
-  its flows inline. Sortable columns re-sort *live* every frame.
+- **A — Ledger + Info View** (current favorite, per user reaction): NetLimiter-style. Dense
+  sortable table left; right-docked Info View driven by the selected row. Process selection
+  shows properties (name/PID/service/path) + activity; flow selection shows connection
+  properties (protocol, local, remote, remote name, country) + activity + a **Tools** section
+  stubbed with Traceroute / MTR / WHOIS / Copy — extension points that would run against the
+  selected address (v2+). Click a process row to select + toggle its flows; click a flow row
+  to inspect it. Sortable columns re-sort *live* every frame.
 - **B — Inspector**: master–detail. Activity-sorted process list left; click one to inspect
   its live speeds, in-session totals, and flow table on the right.
 - **C — Pulse**: dashboard. Global down/up meters up top, processes as ranked activity bars
@@ -60,4 +65,8 @@ Domain details baked in (from the research decisions):
   dx11.zig:1416). Real keyboards always send repeat ≥ 1; only synthetic senders hit it.
 - Arrow keys conflict with GridWidget keyboard navigation once a grid has focus.
 - Live re-sorting every frame makes rows jump while speeds jitter — decide live reorder
-  vs. periodic/frozen ordering.
+  vs. periodic/frozen ordering. It also breaks click accuracy: a click resolves against the
+  row layout of the *previous* frame, so under live reorder you can select the wrong row.
+  Strong argument for periodic (1–2 s) or frozen reorder in v1.
+- Country in the Info View is faked; real data needs an offline GeoIP source (e.g. MaxMind
+  GeoLite2 — licensing + exe-size impact) or an online lookup — a spec decision to record.

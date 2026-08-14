@@ -9,7 +9,7 @@ pub const Variant = enum {
 
     pub fn title(v: Variant) []const u8 {
         return switch (v) {
-            .a_ledger => "A — Ledger (dense table)",
+            .a_ledger => "A — Ledger + Info View",
             .b_inspector => "B — Inspector (master–detail)",
             .c_pulse => "C — Pulse (dashboard)",
         };
@@ -36,6 +36,20 @@ pub const SortField = enum { name, down, up, down_total, up_total };
 
 pub var variant: Variant = .a_ledger;
 pub var cycle: u32 = 0; // teardown→tray-idle→recreate cycles completed (starts at 1 on first open)
+
+/// Variant A info-view selection: a Process Row, or one of its Flows.
+pub const Selection = struct {
+    pid: u32,
+    flow_idx: ?usize = null,
+};
+pub var selected: ?Selection = .{ .pid = 3412, .flow_idx = 0 };
+
+pub fn findProc(pid: u32) ?*data.ProcRow {
+    for (data.procs) |*p| {
+        if (p.pid == pid) return p;
+    }
+    return null;
+}
 pub var sort_field: SortField = .down;
 pub var sort_descending: bool = true;
 pub var selected_pid: u32 = 3412; // variant B selection (steam.exe)
