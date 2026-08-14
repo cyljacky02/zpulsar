@@ -2,10 +2,11 @@
 //! per-Flow identity, lifecycle, and totals inside the Engine thread's
 //! single-threaded state. Flows are keyed (protocol, local endpoint, remote
 //! endpoint, owning PID); endpoint reuse after closure starts a new
-//! Generation — never resuming the old Flow or its totals. Closed Flows
-//! Linger 10 s and then leave the list; their bytes live on in the Process
-//! Row totals, which are independent accumulators (core.zig), never a sum
-//! of visible flows.
+//! Generation — never resuming the old Flow or its totals. Each Flow binds
+//! to its owning Process Row instance (core.zig row index) when it opens and
+//! never migrates. Closed Flows Linger 10 s and then leave the list; their
+//! bytes live on in the Process Row totals, which are independent
+//! accumulators (core.zig), never a sum of visible flows.
 
 const std = @import("std");
 const event = @import("event.zig");
@@ -38,6 +39,9 @@ pub fn flowKey(ev: event.NetEvent) FlowKey {
 
 const Live = struct {
     generation: u32,
+    /// Owning Process Row instance (core.zig row index), bound at open —
+    /// a Flow never migrates between Process Rows.
+    row: u32,
     sent: u64 = 0,
     recv: u64 = 0,
     last_activity_ms: u64,
@@ -56,38 +60,31 @@ const Slot = struct {
 const Lingering = struct {
     key: FlowKey,
     generation: u32,
+    row: u32,
     sent: u64,
     recv: u64,
     expires_at_ms: u64,
 };
-
-/// UDP socket presence: how many live UDP Flows share one (family, local
-/// endpoint, PID). Keeps table-seeded zero-remote placeholders and real
-/// per-remote conversations from double-representing one socket.
-const UdpLocalKey = struct {
-    family: event.Family,
-    local_addr: [16]u8,
-    local_port: u16,
-    pid: u32,
-};
-
-fn udpLocalKey(key: FlowKey) UdpLocalKey {
-    return .{
-        .family = key.tuple.family,
-        .local_addr = key.tuple.local_addr,
-        .local_port = key.tuple.local_port,
-        .pid = key.pid,
-    };
-}
 
 fn isZeroRemote(tuple: event.ConnKey) bool {
     return tuple.remote_port == 0 and
         std.mem.allEqual(u8, &tuple.remote_addr, 0);
 }
 
-/// One Flow ready for Snapshot building, still carrying its owning PID.
+/// A live Flow's presence at the granularity the owner tables know: TCP by
+/// full tuple, UDP collapsed to the local endpoint (event.connKey rules).
+fn presenceTuple(tuple: event.ConnKey) event.ConnKey {
+    var t = tuple;
+    if (t.proto == .udp) {
+        t.remote_addr = @splat(0);
+        t.remote_port = 0;
+    }
+    return t;
+}
+
+/// One Flow ready for Snapshot building, carrying its owning row index.
 pub const Entry = struct {
-    pid: u32,
+    row: u32,
     flow: snapshot.Flow,
 };
 
@@ -97,15 +94,16 @@ pub const Table = struct {
     linger: std.ArrayList(Lingering) = .empty,
     linger_head: usize = 0,
     live_count: usize = 0,
-    udp_local: std.AutoHashMapUnmanaged(UdpLocalKey, u32) = .empty,
-    /// Sweep scratch: the current table snapshot's tuples, reused per sweep.
+    /// Sweep scratch, reused per sweep: the table snapshot's tuples, and the
+    /// tuples still-live Flows cover.
     scratch_tuples: std.AutoHashMapUnmanaged(event.ConnKey, void) = .empty,
+    scratch_live: std.AutoHashMapUnmanaged(event.ConnKey, void) = .empty,
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
         self.slots.deinit(gpa);
         self.linger.deinit(gpa);
-        self.udp_local.deinit(gpa);
         self.scratch_tuples.deinit(gpa);
+        self.scratch_live.deinit(gpa);
     }
 
     pub fn count(self: *const Table) usize {
@@ -113,11 +111,13 @@ pub const Table = struct {
     }
 
     /// Data or connect activity on a key: refresh the live Flow, or open a
-    /// new Generation if the key has none (first activity after closure).
+    /// new Generation owned by `row` if the key has none (first activity
+    /// after closure).
     pub fn touch(
         self: *Table,
         gpa: std.mem.Allocator,
         key: FlowKey,
+        row: u32,
         now_ms: u64,
     ) error{OutOfMemory}!*Live {
         if (self.slots.getPtr(key)) |slot| {
@@ -128,17 +128,12 @@ pub const Table = struct {
         }
         if (key.tuple.proto == .udp and !isZeroRemote(key.tuple))
             try self.dropUdpPlaceholder(gpa, key, now_ms);
-        if (key.tuple.proto == .udp) {
-            const gop = try self.udp_local.getOrPut(gpa, udpLocalKey(key));
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* += 1;
-        }
-        errdefer if (key.tuple.proto == .udp) self.releaseUdpLocal(key);
         const gop = try self.slots.getOrPut(gpa, key);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.last_gen += 1;
         gop.value_ptr.live = .{
             .generation = gop.value_ptr.last_gen,
+            .row = row,
             .last_activity_ms = now_ms,
         };
         self.live_count += 1;
@@ -154,6 +149,7 @@ pub const Table = struct {
         self: *Table,
         gpa: std.mem.Allocator,
         key: FlowKey,
+        row: u32,
         now_ms: u64,
     ) error{OutOfMemory}!void {
         if (self.slots.getPtr(key)) |slot| {
@@ -161,7 +157,7 @@ pub const Table = struct {
                 if (l.sent + l.recv > 0) _ = try self.close(gpa, key, now_ms);
             }
         }
-        _ = try self.touch(gpa, key, now_ms);
+        _ = try self.touch(gpa, key, row, now_ms);
     }
 
     /// A real per-remote conversation supersedes the socket's table-seeded
@@ -185,15 +181,7 @@ pub const Table = struct {
         }
         slot.live = null;
         self.live_count -= 1;
-        self.releaseUdpLocal(placeholder);
         if (slot.linger_count == 0) _ = self.slots.remove(placeholder);
-    }
-
-    fn releaseUdpLocal(self: *Table, key: FlowKey) void {
-        const local = udpLocalKey(key);
-        const n = self.udp_local.getPtr(local).?;
-        n.* -= 1;
-        if (n.* == 0) _ = self.udp_local.remove(local);
     }
 
     /// Close the key's live Flow into Linger. False if none was live.
@@ -209,6 +197,7 @@ pub const Table = struct {
         try self.linger.append(gpa, .{
             .key = key,
             .generation = l.generation,
+            .row = l.row,
             .sent = l.sent,
             .recv = l.recv,
             .expires_at_ms = now_ms + linger_ms,
@@ -216,7 +205,6 @@ pub const Table = struct {
         slot.live = null;
         slot.linger_count += 1;
         self.live_count -= 1;
-        if (key.tuple.proto == .udp) self.releaseUdpLocal(key);
         return true;
     }
 
@@ -282,17 +270,25 @@ pub const Table = struct {
     /// net); a zero-remote UDP placeholder lives exactly as long as its
     /// socket stays bound. Per-remote UDP conversations are the tables'
     /// blind spot and age out on inactivity instead.
+    ///
+    /// `row_source.rowForSeed(pid)` supplies the owning Process Row for a
+    /// Flow this call actually seeds — asked only then, so skipped table
+    /// rows can't mint ghost placeholder rows.
     pub fn reconcile(
         self: *Table,
         gpa: std.mem.Allocator,
         rows: []const tables.SeededConn,
+        row_source: anytype,
         now_ms: u64,
     ) error{OutOfMemory}!bool {
         var changed = false;
         self.scratch_tuples.clearRetainingCapacity();
         for (rows) |r| try self.scratch_tuples.put(gpa, r.key, {});
-        // The tuple check is PID-blind on purpose: duplicated/inherited
-        // sockets appear as sibling Flows, but the table names one owner.
+        // Close/refresh live Flows against the tables, and record what the
+        // survivors cover at table granularity. The presence check is
+        // PID-blind on purpose: duplicated/inherited sockets appear as
+        // sibling Flows, but the table names one owner.
+        self.scratch_live.clearRetainingCapacity();
         var it = self.slots.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.live == null) continue;
@@ -301,6 +297,7 @@ pub const Table = struct {
                 .tcp => if (!self.scratch_tuples.contains(tuple)) {
                     _ = try self.close(gpa, e.key_ptr.*, now_ms);
                     changed = true;
+                    continue;
                 },
                 .udp => if (isZeroRemote(tuple)) {
                     if (self.scratch_tuples.contains(tuple)) {
@@ -308,50 +305,49 @@ pub const Table = struct {
                     } else {
                         _ = try self.close(gpa, e.key_ptr.*, now_ms);
                         changed = true;
+                        continue;
                     }
                 },
             }
+            try self.scratch_live.put(gpa, presenceTuple(tuple), {});
         }
-        // Seed table rows whose key has no live Flow. Half-closed rows are
+        // Seed table rows no surviving Flow covers. Half-closed rows are
         // presence only — seeding them would revive event-closed Flows as
-        // ghosts. A live UDP Flow on the same socket already represents it —
-        // the local-only table row would double it (the seed's job is
-        // presence, and presence is covered).
+        // ghosts. A live UDP Flow on the socket already represents it — the
+        // local-only table row would double it (the seed's job is presence,
+        // and presence is covered).
         for (rows) |r| {
             if (r.closing) continue;
-            const key: FlowKey = .{ .tuple = r.key, .pid = r.pid };
-            if (self.slots.getPtr(key)) |slot| {
-                if (slot.live != null) continue;
-            }
-            if (r.key.proto == .udp and self.udp_local.contains(udpLocalKey(key)))
-                continue;
-            _ = try self.touch(gpa, key, now_ms);
+            if (self.scratch_live.contains(r.key)) continue;
+            const row = try row_source.rowForSeed(r.pid);
+            _ = try self.touch(gpa, .{ .tuple = r.key, .pid = r.pid }, row, now_ms);
+            try self.scratch_live.put(gpa, r.key, {});
             changed = true;
         }
         return changed;
     }
 
-    /// Process exit closes its live Flows immediately into normal Linger
-    /// (spec issue #18 Data model). Wired to Kernel-Process exit events by
-    /// the Process Rows ticket (#21).
-    pub fn processExited(
+    /// A Process Row instance retired: close its live Flows into normal
+    /// Linger (spec issue #18 Data model "process exit closes its live
+    /// Flows immediately into normal Linger").
+    pub fn closeRowFlows(
         self: *Table,
         gpa: std.mem.Allocator,
-        pid: u32,
+        row: u32,
         now_ms: u64,
     ) error{OutOfMemory}!bool {
         var changed = false;
         var it = self.slots.iterator();
         while (it.next()) |e| {
-            if (e.key_ptr.pid != pid) continue;
-            if (e.value_ptr.live == null) continue;
+            const l = e.value_ptr.live orelse continue;
+            if (l.row != row) continue;
             _ = try self.close(gpa, e.key_ptr.*, now_ms);
             changed = true;
         }
         return changed;
     }
 
-    /// Every visible Flow — live and Lingering — with its owning PID.
+    /// Every visible Flow — live and Lingering — with its owning row index.
     pub fn collect(
         self: *const Table,
         gpa: std.mem.Allocator,
@@ -362,16 +358,23 @@ pub const Table = struct {
         while (it.next()) |e| {
             const l = e.value_ptr.live orelse continue;
             out.appendAssumeCapacity(
-                entry(e.key_ptr.*, l.generation, l.sent, l.recv, false),
+                entry(e.key_ptr.*, l.generation, l.row, l.sent, l.recv, false),
             );
         }
         for (self.linger.items[self.linger_head..]) |l| {
-            out.appendAssumeCapacity(entry(l.key, l.generation, l.sent, l.recv, true));
+            out.appendAssumeCapacity(entry(l.key, l.generation, l.row, l.sent, l.recv, true));
         }
     }
 
-    fn entry(key: FlowKey, generation: u32, sent: u64, recv: u64, lingering: bool) Entry {
-        return .{ .pid = key.pid, .flow = .{
+    fn entry(
+        key: FlowKey,
+        generation: u32,
+        row: u32,
+        sent: u64,
+        recv: u64,
+        lingering: bool,
+    ) Entry {
+        return .{ .row = row, .flow = .{
             .proto = key.tuple.proto,
             .family = key.tuple.family,
             .local_addr = key.tuple.local_addr,

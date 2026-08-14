@@ -299,7 +299,7 @@ test "udp rows seed local-only keys matching the event-side normalization" {
         .remote_addr = [4]u8{ 8, 8, 8, 8 } ++ @as([12]u8, @splat(0)),
         .local_port = 53,
         .remote_port = 12345,
-        .timestamp_qpc = 0,
+        .timestamp_ft = 0,
     });
     try std.testing.expectEqual(from_event, c.key);
 }

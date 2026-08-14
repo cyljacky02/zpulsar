@@ -1,9 +1,9 @@
 //! Refcounted, arena-backed immutable Snapshots (ADR-0002; CONTEXT.md
 //! "Snapshot"): the Engine's only window to the outside. Each Snapshot owns
-//! one arena holding itself and its rows; publish swaps a pointer under a
-//! lock that is never taken on the per-event hot path; readers retain/release.
-//! A held reader's view can never change — the Engine only ever builds new
-//! arenas.
+//! one arena holding itself, its rows, and its flows; publish swaps a pointer
+//! under a lock that is never taken on the per-event hot path; readers
+//! retain/release. A held reader's view can never change — the Engine only
+//! ever builds new arenas.
 
 const std = @import("std");
 const event = @import("event.zig");
@@ -33,9 +33,17 @@ pub const Flow = struct {
     service: ?[]const u8 = null,
 };
 
-/// One monitored PID's In-session Totals plus its current connection counts.
+/// One Process Row: a process instance's identity, In-session Totals, its
+/// Flows, and current connection counts. Exited rows persist all session,
+/// so several rows may share a PID (at most one of them live).
 pub const Row = struct {
     pid: u32,
+    /// Display image path (drive-letter converted; bare name for
+    /// kernel/minimal processes). Empty until a start/rundown event names
+    /// the process. Arena-owned by this Snapshot.
+    name: []const u8 = "",
+    /// Dimmed "(exited)" in the UI; totals stay intact.
+    exited: bool = false,
     sent: u64 = 0,
     recv: u64 = 0,
     /// Live (non-Lingering) flow counts by protocol.
@@ -63,9 +71,10 @@ pub const Snapshot = struct {
     /// Monotonic publish sequence number.
     seq: u64,
     health: Health,
-    /// Sorted by pid ascending.
+    /// Sorted by pid ascending (exited instances before a reused PID's live
+    /// successor).
     rows: []const Row,
-    /// All flows, sorted by owning pid — each Row's `flows` is a sub-slice.
+    /// All flows, grouped by owning row — each Row's `flows` is a sub-slice.
     flows: []const Flow,
 
     pub fn retain(self: *Snapshot) void {
@@ -152,12 +161,32 @@ pub fn mutableFlows(snap: *Snapshot) []Flow {
     return @constCast(snap.flows);
 }
 
+/// Copy `bytes` (e.g. a row's display name) into the Snapshot's own arena so
+/// the row data stays self-contained. Valid only between create and publish;
+/// the arena state is re-captured so release() frees these too.
+pub fn arenaDupe(snap: *Snapshot, bytes: []const u8) error{OutOfMemory}![]const u8 {
+    var arena = snap.arena_state.promote(snap.gpa);
+    defer snap.arena_state = arena.state;
+    return arena.allocator().dupe(u8, bytes);
+}
+
 test "release frees the whole arena exactly once" {
     // std.testing.allocator fails the test on leak or double-free.
     const snap = try create(std.testing.allocator, 100, 0);
     snap.retain();
     snap.release();
     snap.release();
+}
+
+test "arena-duped names live and die with the snapshot" {
+    const snap = try create(std.testing.allocator, 1, 0);
+    mutableRows(snap)[0] = .{
+        .pid = 7,
+        // Long enough to force the arena to grow a fresh buffer node.
+        .name = try arenaDupe(snap, "C:\\Windows\\System32\\svchost.exe" ** 40),
+    };
+    try std.testing.expect(std.mem.startsWith(u8, snap.rows[0].name, "C:\\Windows"));
+    snap.release(); // the allocator flags the name bytes if they leaked
 }
 
 test "publish transfers ownership and releases the replaced snapshot" {
