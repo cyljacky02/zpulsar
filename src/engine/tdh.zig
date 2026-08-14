@@ -25,6 +25,8 @@ pub const FieldOffsets = struct {
 };
 
 /// Same record construction as parser.parseV0, with schema-derived offsets.
+/// Only the offsets differ: which field is the local side is decided by the
+/// one shared rule, so the fallback cannot drift from the hot path (issue #36).
 pub fn parseWithOffsets(
     id: u16,
     off: FieldOffsets,
@@ -44,15 +46,19 @@ pub fn parseWithOffsets(
         .size = 0,
         .local_addr = @splat(0),
         .remote_addr = @splat(0),
-        .local_port = std.mem.readInt(u16, user_data[off.sport..][0..2], .big),
-        .remote_port = std.mem.readInt(u16, user_data[off.dport..][0..2], .big),
+        .local_port = undefined,
+        .remote_port = undefined,
         .timestamp_ft = timestamp_ft,
     };
     if (class.op == .send or class.op == .recv)
         out.size = std.mem.readInt(u32, user_data[off.size..][0..4], .little);
     const addr_len: usize = off.addr_len;
-    @memcpy(out.remote_addr[0..addr_len], user_data[off.daddr..][0..addr_len]);
-    @memcpy(out.local_addr[0..addr_len], user_data[off.saddr..][0..addr_len]);
+    parser.assignEndpoints(&out, class.orientation(), .{
+        .daddr = user_data[off.daddr..][0..addr_len],
+        .saddr = user_data[off.saddr..][0..addr_len],
+        .dport = std.mem.readInt(u16, user_data[off.dport..][0..2], .big),
+        .sport = std.mem.readInt(u16, user_data[off.sport..][0..2], .big),
+    });
     return out;
 }
 
@@ -306,6 +312,37 @@ test "derivation follows inserted fields in a hypothetical future version" {
     try std.testing.expectEqual(@as(u16, 443), ev.remote_port);
     try std.testing.expectEqual(@as(u16, 51000), ev.local_port);
     try std.testing.expectEqual(event.Family.v6, ev.family);
+}
+
+test "the fallback orients per (id, direction), exactly as the hot path does" {
+    // The payload issue #36 reported: a DNS answer arriving from 8.8.8.8:53
+    // at this machine's 192.168.88.254:60253. saddr is the sender.
+    var payload: [20]u8 = @splat(0);
+    std.mem.writeInt(u32, payload[0..4], 4242, .little); // PID
+    std.mem.writeInt(u32, payload[4..8], 51, .little); // size
+    @memcpy(payload[8..12], &[4]u8{ 192, 168, 88, 254 }); // daddr — the receiver
+    @memcpy(payload[12..16], &[4]u8{ 8, 8, 8, 8 }); // saddr — the sender
+    std.mem.writeInt(u16, payload[16..18], 60253, .big); // dport
+    std.mem.writeInt(u16, payload[18..20], 53, .big); // sport
+
+    const udp = parseWithOffsets(parser.Id.udp4_recv, test_v4_offsets, &payload, 9) orelse
+        return error.ParseFailed;
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 88, 254 }, udp.local_addr[0..4]);
+    try std.testing.expectEqual(@as(u16, 60253), udp.local_port);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 8, 8, 8, 8 }, udp.remote_addr[0..4]);
+    try std.testing.expectEqual(@as(u16, 53), udp.remote_port);
+    // Derived offsets change where the fields are, never which one is local:
+    // on a v0 payload the two paths must produce the identical record.
+    try std.testing.expectEqual(
+        parser.parseV0(parser.Id.udp4_recv, &payload, 9),
+        @as(?event.NetEvent, udp),
+    );
+
+    // The same bytes read as TCP recv stay endpoint-oriented.
+    const tcp = parseWithOffsets(parser.Id.tcp4_recv, test_v4_offsets, &payload, 9) orelse
+        return error.ParseFailed;
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 8, 8, 8, 8 }, tcp.local_addr[0..4]);
+    try std.testing.expectEqual(@as(u16, 53), tcp.local_port);
 }
 
 test "derivation refuses schemas it cannot walk" {
