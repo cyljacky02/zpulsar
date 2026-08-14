@@ -81,9 +81,7 @@ pub fn start(logical_cpus: u32) StartError!Session {
 /// Returns true if a session was stopped. Safe to call concurrently with or
 /// after `Session.stop` — a second stop reports not-found and is ignored.
 pub fn stopByName() bool {
-    var buf: PropertiesBuffer = undefined;
-    buildControlProperties(&buf);
-    return win32.ControlTraceW(0, session_name_w, &buf.props, .STOP) == .NO_ERROR;
+    return stopByNameWith(Win32Ops) == .NO_ERROR;
 }
 
 /// The start flow with injectable trace-control ops (the test seam; ETW
@@ -98,9 +96,7 @@ fn startWith(comptime Ops: type, logical_cpus: u32) StartError!Session {
     var adopted_orphan = false;
     if (rc == .ERROR_ALREADY_EXISTS) {
         // Crash orphan: stop it by name and retry (self-healing, ADR-0002).
-        var stop_buf: PropertiesBuffer = undefined;
-        buildControlProperties(&stop_buf);
-        if (Ops.stopTraceByName(session_name_w, &stop_buf.props) != .NO_ERROR)
+        if (stopByNameWith(Ops) != .NO_ERROR)
             return error.StartFailed;
         adopted_orphan = true;
         buildProperties(&buf, logical_cpus); // ETW wrote into the buffer
@@ -119,13 +115,17 @@ fn startWith(comptime Ops: type, logical_cpus: u32) StartError!Session {
         kernel_network_keyword_ipv4 | kernel_network_keyword_ipv6,
     );
     if (enable_rc != .NO_ERROR) {
-        var stop_buf: PropertiesBuffer = undefined;
-        buildControlProperties(&stop_buf);
-        _ = Ops.stopTraceByName(session_name_w, &stop_buf.props);
+        _ = stopByNameWith(Ops);
         return error.EnableFailed;
     }
 
     return .{ .handle = handle, .adopted_orphan = adopted_orphan };
+}
+
+fn stopByNameWith(comptime Ops: type) win32.WIN32_ERROR {
+    var buf: PropertiesBuffer = undefined;
+    buildControlProperties(&buf);
+    return Ops.stopTraceByName(session_name_w, &buf.props);
 }
 
 /// Zeroed properties for ControlTraceW: ETW writes the session's properties
@@ -183,7 +183,7 @@ const TestOps = struct {
     var starts_seen: usize = 0;
     var enabled_keywords: u64 = 0;
 
-    fn calls(call: Call) void {
+    fn record(call: Call) void {
         calls_buf[calls_len] = call;
         calls_len += 1;
     }
@@ -208,7 +208,7 @@ const TestOps = struct {
     ) win32.WIN32_ERROR {
         _ = props;
         std.debug.assert(std.mem.eql(u16, std.mem.span(name), session_name_w));
-        calls(.start);
+        record(.start);
         const rc = start_rcs[starts_seen];
         starts_seen += 1;
         if (rc == .NO_ERROR) handle.* = 42;
@@ -221,7 +221,7 @@ const TestOps = struct {
     ) win32.WIN32_ERROR {
         _ = props;
         std.debug.assert(std.mem.eql(u16, std.mem.span(name), session_name_w));
-        calls(.stop_by_name);
+        record(.stop_by_name);
         return stop_rc;
     }
 
@@ -232,7 +232,7 @@ const TestOps = struct {
     ) win32.WIN32_ERROR {
         std.debug.assert(handle == 42);
         std.debug.assert(std.mem.eql(u8, &provider.Bytes, &kernel_network_guid.Bytes));
-        calls(.enable);
+        record(.enable);
         enabled_keywords = any_keywords;
         return enable_rc;
     }

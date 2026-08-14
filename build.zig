@@ -5,6 +5,9 @@ const std = @import("std");
 // The boundary is structural — a module can only @import what is listed in its
 // `imports`, so e.g. `@import("dvui")` or `@import("zigwin32")` inside the
 // engine module is a compile error ("no module named ... available").
+// Nuance: Zig analyzes lazily, so the error fires on any *referenced* import —
+// an unused `const x = @import("dvui")` that nothing touches compiles
+// silently, but any actual use cannot.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

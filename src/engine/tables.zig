@@ -7,7 +7,9 @@ const win32 = @import("win32");
 
 /// Row counts of the four owner tables the Engine cold-starts from
 /// (spec issue #18 "Cold start"; docs/research/etw-tcp-udp-pipeline.md §4).
-pub const SnapshotCounts = struct {
+/// Not to be confused with the glossary's Snapshot (the Engine's published
+/// state) — this is the raw IP Helper table probe.
+pub const TableCounts = struct {
     tcp4: u32,
     tcp6: u32,
     udp4: u32,
@@ -17,7 +19,7 @@ pub const SnapshotCounts = struct {
 pub const SnapshotError = error{ OutOfMemory, TableQueryFailed };
 
 /// Query all four TCP/UDP owner-PID tables and return their row counts.
-pub fn snapshotCounts(gpa: std.mem.Allocator) SnapshotError!SnapshotCounts {
+pub fn snapshotTableCounts(gpa: std.mem.Allocator) SnapshotError!TableCounts {
     return .{
         .tcp4 = try tableRowCount(gpa, .tcp, win32.AF_INET),
         .tcp6 = try tableRowCount(gpa, .tcp, win32.AF_INET6),

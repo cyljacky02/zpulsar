@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     );
     std.debug.print("Kernel-Network enabled (keywords IPv4|IPv6)\n", .{});
 
-    const counts = engine.tables.snapshotCounts(gpa) catch {
+    const counts = engine.tables.snapshotTableCounts(gpa) catch {
         std.debug.print("error: TCP/UDP table snapshot failed\n", .{});
         // The deferred stop still runs; exit through the error path.
         return error.SnapshotFailed;
@@ -74,7 +74,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (hold_seconds > 0) {
         std.debug.print("holding session for {d}s (Ctrl+C stops it early)...\n", .{hold_seconds});
-        win32.Sleep(@intCast(hold_seconds * std.time.ms_per_s));
+        // Saturate instead of trapping: an absurd --hold must not panic past
+        // the deferred stop. 0xFFFFFFFF would be INFINITE, hence the -1.
+        const hold_ms = hold_seconds *| @as(u64, std.time.ms_per_s);
+        win32.Sleep(std.math.cast(u32, hold_ms) orelse std.math.maxInt(u32) - 1);
     }
 }
 

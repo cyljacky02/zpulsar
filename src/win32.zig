@@ -12,7 +12,6 @@ const zigwin32 = @import("zigwin32");
 const etw = zigwin32.system.diagnostics.etw;
 const ip_helper = zigwin32.network_management.ip_helper;
 const win_sock = zigwin32.networking.win_sock;
-const console = zigwin32.system.console;
 const foundation = zigwin32.foundation;
 
 // ---------------------------------------------------------------------------
@@ -105,10 +104,6 @@ pub const AF_INET6: u32 = @intFromEnum(win_sock.AF_INET6);
 
 pub const SetConsoleCtrlHandler = zigwin32.kernel32.SetConsoleCtrlHandler;
 pub const Sleep = zigwin32.kernel32.Sleep;
-pub const PHANDLER_ROUTINE = console.PHANDLER_ROUTINE;
-pub const CTRL_C_EVENT = console.CTRL_C_EVENT;
-pub const CTRL_BREAK_EVENT = console.CTRL_BREAK_EVENT;
-pub const CTRL_CLOSE_EVENT = console.CTRL_CLOSE_EVENT;
 
 // ---------------------------------------------------------------------------
 // Comptime ABI asserts — Windows SDK 10.0.26100.0, x64.
