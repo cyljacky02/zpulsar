@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const hostnames = @import("hostnames.zig");
 const snapshot = @import("snapshot.zig");
 const tables = @import("tables.zig");
 
@@ -37,6 +38,39 @@ pub fn flowKey(ev: event.NetEvent) FlowKey {
     } };
 }
 
+/// A Flow's remote name, resolved once at creation and stored here rather
+/// than re-derived per repaint (spec issue #18; research §5). Empty text means
+/// the Flow shows its bare endpoint. Strings are owned by the Table.
+///
+/// An observed name is permanent — the first one wins, so CDN churn cannot
+/// rewrite the label a connection was made under. A hint only ever fills a
+/// Flow that has no name at all.
+const FlowName = struct {
+    text: []const u8 = "",
+    alias: []const u8 = "",
+    origin: hostnames.Origin = .observed,
+
+    fn isObserved(self: FlowName) bool {
+        return self.text.len > 0 and self.origin == .observed;
+    }
+
+    fn dupe(gpa: std.mem.Allocator, name: hostnames.Name) error{OutOfMemory}!FlowName {
+        const text = try gpa.dupe(u8, name.text);
+        errdefer gpa.free(text);
+        return .{
+            .text = text,
+            .alias = try gpa.dupe(u8, name.alias),
+            .origin = name.origin,
+        };
+    }
+
+    fn deinit(self: *FlowName, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        gpa.free(self.alias);
+        self.* = .{};
+    }
+};
+
 const Live = struct {
     generation: u32,
     /// Owning Process Row instance (core.zig row index), bound at open —
@@ -45,6 +79,9 @@ const Live = struct {
     sent: u64 = 0,
     recv: u64 = 0,
     last_activity_ms: u64,
+    /// When the Flow opened — what the reverse-lookup grace is measured from.
+    opened_ms: u64,
+    name: FlowName = .{},
 };
 
 /// One key's history: the current live Flow (if any), how many closed
@@ -56,7 +93,9 @@ const Slot = struct {
     linger_count: u32 = 0,
 };
 
-/// A closed Flow riding out its Linger window. Totals are frozen at close.
+/// A closed Flow riding out its Linger window. Totals are frozen at close;
+/// the name is not — a Lingering Flow is still on screen, so a late
+/// observation still upgrades it.
 const Lingering = struct {
     key: FlowKey,
     generation: u32,
@@ -64,7 +103,17 @@ const Lingering = struct {
     sent: u64,
     recv: u64,
     expires_at_ms: u64,
+    name: FlowName,
 };
+
+/// The remote endpoint a Flow's name is keyed on. Normalized, because a
+/// dual-stack socket reaching an IPv4 host reports `::ffff:a.b.c.d` while the
+/// resolver's answer normalizes to plain v4 — unnormalized, such a Flow could
+/// never match its own observation. Flow *identity* keeps the raw address:
+/// this is the naming key only.
+fn remoteOf(tuple: event.ConnKey) event.IpAddr {
+    return (event.IpAddr{ .family = tuple.family, .addr = tuple.remote_addr }).normalized();
+}
 
 fn isZeroRemote(tuple: event.ConnKey) bool {
     return tuple.remote_port == 0 and
@@ -100,6 +149,12 @@ pub const Table = struct {
     scratch_live: std.AutoHashMapUnmanaged(event.ConnKey, void) = .empty,
 
     pub fn deinit(self: *Table, gpa: std.mem.Allocator) void {
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.live) |*l| l.name.deinit(gpa);
+        }
+        // Entries before `linger_head` were already released as they expired.
+        for (self.linger.items[self.linger_head..]) |*l| l.name.deinit(gpa);
         self.slots.deinit(gpa);
         self.linger.deinit(gpa);
         self.scratch_tuples.deinit(gpa);
@@ -112,13 +167,15 @@ pub const Table = struct {
 
     /// Data or connect activity on a key: refresh the live Flow, or open a
     /// new Generation owned by `row` if the key has none (first activity
-    /// after closure).
+    /// after closure). A new Flow resolves its remote name here, once
+    /// (CONTEXT.md "Hostname Attribution").
     pub fn touch(
         self: *Table,
         gpa: std.mem.Allocator,
         key: FlowKey,
         row: u32,
         now_ms: u64,
+        names: *hostnames.Table,
     ) error{OutOfMemory}!*Live {
         if (self.slots.getPtr(key)) |slot| {
             if (slot.live) |*l| {
@@ -128,6 +185,11 @@ pub const Table = struct {
         }
         if (key.tuple.proto == .udp and !isZeroRemote(key.tuple))
             try self.dropUdpPlaceholder(gpa, key, now_ms);
+        const name = try resolveName(gpa, key, now_ms, names);
+        errdefer {
+            var owned = name;
+            owned.deinit(gpa);
+        }
         const gop = try self.slots.getOrPut(gpa, key);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.last_gen += 1;
@@ -135,9 +197,25 @@ pub const Table = struct {
             .generation = gop.value_ptr.last_gen,
             .row = row,
             .last_activity_ms = now_ms,
+            .opened_ms = now_ms,
+            .name = name,
         };
         self.live_count += 1;
         return &gop.value_ptr.live.?;
+    }
+
+    /// The tiered lookup, done once per Flow. A bound socket with no observed
+    /// conversation (the UDP table's zero-remote placeholder) has no remote to
+    /// name.
+    fn resolveName(
+        gpa: std.mem.Allocator,
+        key: FlowKey,
+        now_ms: u64,
+        names: *hostnames.Table,
+    ) error{OutOfMemory}!FlowName {
+        if (isZeroRemote(key.tuple)) return .{};
+        const found = names.lookup(key.pid, remoteOf(key.tuple), now_ms) orelse return .{};
+        return FlowName.dupe(gpa, found);
     }
 
     /// A connect (or accept) means a new connection. On a live Flow that has
@@ -151,13 +229,14 @@ pub const Table = struct {
         key: FlowKey,
         row: u32,
         now_ms: u64,
+        names: *hostnames.Table,
     ) error{OutOfMemory}!void {
         if (self.slots.getPtr(key)) |slot| {
             if (slot.live) |l| {
                 if (l.sent + l.recv > 0) _ = try self.close(gpa, key, now_ms);
             }
         }
-        _ = try self.touch(gpa, key, row, now_ms);
+        _ = try self.touch(gpa, key, row, now_ms, names);
     }
 
     /// A real per-remote conversation supersedes the socket's table-seeded
@@ -174,11 +253,12 @@ pub const Table = struct {
         placeholder.tuple.remote_addr = @splat(0);
         placeholder.tuple.remote_port = 0;
         const slot = self.slots.getPtr(placeholder) orelse return;
-        const l = slot.live orelse return;
-        if (l.sent + l.recv > 0) {
+        if (slot.live == null) return;
+        if (slot.live.?.sent + slot.live.?.recv > 0) {
             _ = try self.close(gpa, placeholder, now_ms);
             return;
         }
+        slot.live.?.name.deinit(gpa);
         slot.live = null;
         self.live_count -= 1;
         if (slot.linger_count == 0) _ = self.slots.remove(placeholder);
@@ -194,6 +274,8 @@ pub const Table = struct {
     ) error{OutOfMemory}!bool {
         const slot = self.slots.getPtr(key) orelse return false;
         const l = slot.live orelse return false;
+        // The name moves across rather than being copied — the live Flow is
+        // dropped in the same breath, so ownership transfers exactly once.
         try self.linger.append(gpa, .{
             .key = key,
             .generation = l.generation,
@@ -201,6 +283,7 @@ pub const Table = struct {
             .sent = l.sent,
             .recv = l.recv,
             .expires_at_ms = now_ms + linger_ms,
+            .name = l.name,
         });
         slot.live = null;
         slot.linger_count += 1;
@@ -220,6 +303,7 @@ pub const Table = struct {
         while (self.linger_head < self.linger.items.len) {
             const l = self.linger.items[self.linger_head];
             if (l.expires_at_ms > now_ms) break;
+            self.linger.items[self.linger_head].name.deinit(gpa);
             self.linger_head += 1;
             changed = true;
             const slot = self.slots.getPtr(l.key).?;
@@ -280,6 +364,7 @@ pub const Table = struct {
         rows: []const tables.SeededConn,
         row_source: anytype,
         now_ms: u64,
+        names: *hostnames.Table,
     ) error{OutOfMemory}!bool {
         var changed = false;
         self.scratch_tuples.clearRetainingCapacity();
@@ -320,7 +405,7 @@ pub const Table = struct {
             if (r.closing) continue;
             if (self.scratch_live.contains(r.key)) continue;
             const row = try row_source.rowForSeed(r.pid);
-            _ = try self.touch(gpa, .{ .tuple = r.key, .pid = r.pid }, row, now_ms);
+            _ = try self.touch(gpa, .{ .tuple = r.key, .pid = r.pid }, row, now_ms, names);
             try self.scratch_live.put(gpa, r.key, {});
             changed = true;
         }
@@ -347,6 +432,94 @@ pub const Table = struct {
         return changed;
     }
 
+    /// A name landed for `ip`: upgrade every visible Flow to that address in
+    /// place, live and Lingering alike (spec issue #18: "a later observation
+    /// upgrades it in place, and un-dims it"). True if anything changed.
+    ///
+    /// An observed name is permanent — the first one wins — so this only ever
+    /// promotes: bare → hint, bare → observed, hint → observed.
+    ///
+    /// A bound socket with no observed conversation has no remote to name, so
+    /// the zero-remote placeholders sit this out — otherwise a resolver that
+    /// answers `0.0.0.0` for blocked names (pi-hole and friends do) would
+    /// label every idle UDP socket with whatever it just blocked.
+    pub fn applyName(
+        self: *Table,
+        gpa: std.mem.Allocator,
+        ip: event.IpAddr,
+        name: hostnames.Name,
+    ) error{OutOfMemory}!bool {
+        var changed = false;
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            if (!namesAddress(e.key_ptr.tuple, ip)) continue;
+            if (e.value_ptr.live) |*l|
+                changed = try upgrade(gpa, &l.name, name) or changed;
+        }
+        for (self.linger.items[self.linger_head..]) |*l| {
+            if (!namesAddress(l.key.tuple, ip)) continue;
+            changed = try upgrade(gpa, &l.name, name) or changed;
+        }
+        return changed;
+    }
+
+    /// Whether a name for `ip` belongs on a Flow with this tuple.
+    fn namesAddress(tuple: event.ConnKey, ip: event.IpAddr) bool {
+        return !isZeroRemote(tuple) and std.meta.eql(remoteOf(tuple), ip);
+    }
+
+    fn upgrade(
+        gpa: std.mem.Allocator,
+        current: *FlowName,
+        name: hostnames.Name,
+    ) error{OutOfMemory}!bool {
+        if (current.isObserved()) return false;
+        // A hint fills a blank, never replaces another hint: swapping one
+        // guess for another is churn the user cannot act on.
+        if (name.origin != .observed and current.text.len > 0) return false;
+        const replacement = try FlowName.dupe(gpa, name);
+        current.deinit(gpa);
+        current.* = replacement;
+        return true;
+    }
+
+    /// Periodic name maintenance over the live Flows, run at the Engine's
+    /// cadence. Two duties, one walk:
+    ///
+    /// - a Flow that carries a name refreshes its cache entries, so an active
+    ///   conversation never idles out of the tiers (research §5);
+    /// - a Flow still showing a bare endpoint past the grace becomes a
+    ///   reverse-lookup candidate, deduplicated by address.
+    ///
+    /// Candidates come out claimed (marked in flight): the caller releases the
+    /// claim for any address it fails to queue.
+    pub fn maintainNames(
+        self: *Table,
+        gpa: std.mem.Allocator,
+        names: *hostnames.Table,
+        now_ms: u64,
+        reverse_out: *std.ArrayList(event.IpAddr),
+    ) error{OutOfMemory}!void {
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            const tuple = e.key_ptr.tuple;
+            if (isZeroRemote(tuple)) continue;
+            const l = e.value_ptr.live orelse continue;
+            const ip = remoteOf(tuple);
+            if (l.name.text.len > 0) {
+                names.touch(e.key_ptr.pid, ip, now_ms);
+                continue;
+            }
+            if (now_ms -| l.opened_ms < hostnames.reverse_grace_ms) continue;
+            if (!names.wantsReverse(ip, now_ms)) continue;
+            if (!try names.markPending(gpa, ip)) continue;
+            reverse_out.append(gpa, ip) catch |err| {
+                names.clearPending(ip);
+                return err;
+            };
+        }
+    }
+
     /// Every visible Flow — live and Lingering — with its owning row index.
     pub fn collect(
         self: *const Table,
@@ -358,11 +531,13 @@ pub const Table = struct {
         while (it.next()) |e| {
             const l = e.value_ptr.live orelse continue;
             out.appendAssumeCapacity(
-                entry(e.key_ptr.*, l.generation, l.row, l.sent, l.recv, false),
+                entry(e.key_ptr.*, l.generation, l.row, l.sent, l.recv, false, l.name),
             );
         }
         for (self.linger.items[self.linger_head..]) |l| {
-            out.appendAssumeCapacity(entry(l.key, l.generation, l.row, l.sent, l.recv, true));
+            out.appendAssumeCapacity(
+                entry(l.key, l.generation, l.row, l.sent, l.recv, true, l.name),
+            );
         }
     }
 
@@ -373,6 +548,7 @@ pub const Table = struct {
         sent: u64,
         recv: u64,
         lingering: bool,
+        name: FlowName,
     ) Entry {
         return .{ .row = row, .flow = .{
             .proto = key.tuple.proto,
@@ -385,6 +561,11 @@ pub const Table = struct {
             .sent = sent,
             .recv = recv,
             .lingering = lingering,
+            // Borrowed from the Table; the Snapshot build copies them into its
+            // own arena before publishing.
+            .remote_hostname = if (name.text.len > 0) name.text else null,
+            .remote_alias = if (name.alias.len > 0) name.alias else null,
+            .hostname_origin = name.origin,
         } };
     }
 };

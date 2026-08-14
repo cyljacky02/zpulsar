@@ -11,6 +11,7 @@ const consumer_mod = @import("consumer.zig");
 const core_mod = @import("core.zig");
 const device_map = @import("device_map.zig");
 const etw_session = @import("etw_session.zig");
+const reverse_lookup = @import("reverse_lookup.zig");
 const snapshot = @import("snapshot.zig");
 const sync = @import("sync.zig");
 const tables = @import("tables.zig");
@@ -42,7 +43,11 @@ pub const Engine = struct {
     session: etw_session.Session,
     ring: *consumer_mod.Ring,
     process_ring: *consumer_mod.ProcessRing,
+    dns_ring: *consumer_mod.DnsRing,
     consumer: *consumer_mod.Consumer,
+    /// Null when the lane could not be brought up: hostname observation still
+    /// works, unresolved Flows just keep their bare endpoints.
+    reverse: ?*reverse_lookup.Lane,
     core: core_mod.Core,
     published: snapshot.Published,
     ring_wake: sync.WakeEvent,
@@ -71,6 +76,10 @@ pub const Engine = struct {
         errdefer gpa.destroy(process_ring);
         process_ring.* = .{};
 
+        const dns_ring = try gpa.create(consumer_mod.DnsRing);
+        errdefer gpa.destroy(dns_ring);
+        dns_ring.* = .{};
+
         const cons = try gpa.create(consumer_mod.Consumer);
         errdefer gpa.destroy(cons);
 
@@ -79,7 +88,7 @@ pub const Engine = struct {
         var published = try snapshot.Published.init();
         errdefer published.deinit();
 
-        cons.* = .init(ring, process_ring, ring_wake, gpa);
+        cons.* = .init(ring, process_ring, dns_ring, ring_wake, gpa);
         errdefer cons.deinit();
 
         self.* = .{
@@ -87,12 +96,15 @@ pub const Engine = struct {
             .session = session,
             .ring = ring,
             .process_ring = process_ring,
+            .dns_ring = dns_ring,
             .consumer = cons,
+            .reverse = startReverseLane(gpa),
             .core = .init(gpa),
             .published = published,
             .ring_wake = ring_wake,
         };
         errdefer self.core.deinit();
+        self.core.reverse = self.reverse;
 
         // Display-only: a failed drive map just leaves names as raw NT paths.
         self.core.drive_map = device_map.query(gpa) catch .{};
@@ -120,6 +132,23 @@ pub const Engine = struct {
         return self;
     }
 
+    /// Bring the reverse-lookup lane up. A failure here is not fatal — the
+    /// spec's fallback is itself a fallback, so the Engine runs without it and
+    /// Flows that miss every tier keep their bare endpoints.
+    fn startReverseLane(gpa: std.mem.Allocator) ?*reverse_lookup.Lane {
+        const lane = gpa.create(reverse_lookup.Lane) catch return null;
+        lane.* = reverse_lookup.Lane.init() catch {
+            gpa.destroy(lane);
+            return null;
+        };
+        lane.start() catch {
+            lane.deinit();
+            gpa.destroy(lane);
+            return null;
+        };
+        return lane;
+    }
+
     /// Full ordered shutdown, session stop included — ControlTrace(STOP) is
     /// never skipped, and it is what deterministically unblocks ProcessTrace.
     pub fn stop(self: *Engine) void {
@@ -135,6 +164,18 @@ pub const Engine = struct {
         gpa.destroy(self.consumer);
         gpa.destroy(self.ring);
         gpa.destroy(self.process_ring);
+        gpa.destroy(self.dns_ring);
+        if (self.reverse) |lane| switch (lane.stop()) {
+            .joined => {
+                lane.deinit();
+                gpa.destroy(lane);
+            },
+            // Still inside a blocking GetNameInfoW past the 2 s timeout: the
+            // thread is abandoned and its Lane leaked on purpose (ADR-0002).
+            // Freeing it — or closing its handles — is what would be unsafe;
+            // the process is exiting anyway.
+            .abandoned => {},
+        };
         self.published.deinit();
         self.ring_wake.deinit();
         self.core.deinit();
@@ -171,6 +212,18 @@ pub const Engine = struct {
                 self.core.applyEvent(ev, drain_now) catch {
                     self.oom_drops += 1;
                 };
+            }
+            // Observations last: a resolution drained after the connect it
+            // preceded still upgrades the Flow in place, so ordering here is
+            // a nicety rather than a correctness requirement.
+            //
+            // A dropped observation is deliberately *not* counted as ring
+            // loss: it costs a name, never a byte, and the affected Flows
+            // fall through to the reverse-lookup lane. Feeding it into the
+            // loss signal would re-baseline the totals and flag them as
+            // possibly low over something that never touched them.
+            while (self.dns_ring.pop()) |dev| {
+                self.core.applyDns(dev, drain_now) catch {};
             }
 
             const now = win32.GetTickCount64() - t0;
