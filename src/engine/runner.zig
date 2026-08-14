@@ -9,6 +9,7 @@ const std = @import("std");
 const win32 = @import("win32");
 const consumer_mod = @import("consumer.zig");
 const core_mod = @import("core.zig");
+const device_map = @import("device_map.zig");
 const etw_session = @import("etw_session.zig");
 const snapshot = @import("snapshot.zig");
 const sync = @import("sync.zig");
@@ -35,6 +36,7 @@ pub const Engine = struct {
     gpa: std.mem.Allocator,
     session: etw_session.Session,
     ring: *consumer_mod.Ring,
+    process_ring: *consumer_mod.ProcessRing,
     consumer: *consumer_mod.Consumer,
     core: core_mod.Core,
     published: snapshot.Published,
@@ -48,9 +50,10 @@ pub const Engine = struct {
     engine_thread: std.Thread = undefined,
 
     /// Bring the hot path up on an already-started session. Order per the
-    /// research doc §4: consumer handle opens first (events buffer in the
-    /// session), then the cold-start table seed, then the threads — events
-    /// that raced the seed reconcile by normalized key.
+    /// research docs: consumer handle opens first (events buffer in the
+    /// session), then the cold-start table seed, then the threads, then the
+    /// CAPTURE_STATE rundown request — issued only once the consumer is live
+    /// so the burst cannot race its startup (kernel-process research §5).
     pub fn start(gpa: std.mem.Allocator, session: etw_session.Session) StartError!*Engine {
         const self = try gpa.create(Engine);
         errdefer gpa.destroy(self);
@@ -58,6 +61,10 @@ pub const Engine = struct {
         const ring = try gpa.create(consumer_mod.Ring);
         errdefer gpa.destroy(ring);
         ring.* = .{};
+
+        const process_ring = try gpa.create(consumer_mod.ProcessRing);
+        errdefer gpa.destroy(process_ring);
+        process_ring.* = .{};
 
         const cons = try gpa.create(consumer_mod.Consumer);
         errdefer gpa.destroy(cons);
@@ -67,19 +74,23 @@ pub const Engine = struct {
         var published = try snapshot.Published.init();
         errdefer published.deinit();
 
-        cons.* = .init(ring, ring_wake, gpa);
+        cons.* = .init(ring, process_ring, ring_wake, gpa);
         errdefer cons.deinit();
 
         self.* = .{
             .gpa = gpa,
             .session = session,
             .ring = ring,
+            .process_ring = process_ring,
             .consumer = cons,
             .core = .init(gpa),
             .published = published,
             .ring_wake = ring_wake,
         };
         errdefer self.core.deinit();
+
+        // Display-only: a failed drive map just leaves names as raw NT paths.
+        self.core.drive_map = device_map.query(gpa) catch .{};
 
         try cons.open();
         errdefer cons.close();
@@ -98,6 +109,9 @@ pub const Engine = struct {
             self.consumer.close();
             return error.SpawnFailed;
         };
+
+        // Cold-start process rundown: one ID-15 event per live process.
+        session.captureState();
         return self;
     }
 
@@ -115,6 +129,7 @@ pub const Engine = struct {
         self.consumer.deinit();
         gpa.destroy(self.consumer);
         gpa.destroy(self.ring);
+        gpa.destroy(self.process_ring);
         self.published.deinit();
         self.ring_wake.deinit();
         self.core.deinit();
@@ -138,6 +153,13 @@ pub const Engine = struct {
         var ticks: u32 = 0;
 
         while (!self.stop_requested.load(.acquire)) {
+            // Identity first: a start/rundown drained before its instance's
+            // traffic saves the placeholder round trip.
+            while (self.process_ring.pop()) |pev| {
+                self.core.applyProcess(pev) catch {
+                    self.oom_drops += 1;
+                };
+            }
             while (self.ring.pop()) |ev| {
                 self.core.applyEvent(ev) catch {
                     self.oom_drops += 1;
@@ -152,7 +174,9 @@ pub const Engine = struct {
                 if (ticks % loss_check_every_ticks == 0) {
                     if (self.session.queryEventsLost()) |lost| self.events_lost = lost;
                 }
-                if (self.core.noteLoss(self.ring.droppedTotal() + self.oom_drops, self.events_lost))
+                const ring_loss = self.ring.droppedTotal() + self.process_ring.droppedTotal() +
+                    self.oom_drops;
+                if (self.core.noteLoss(ring_loss, self.events_lost))
                     self.rebaseline();
             }
 
@@ -176,9 +200,11 @@ pub const Engine = struct {
     }
 
     /// Unified loss recovery (ADR-0002): re-baseline the connection list
-    /// from fresh tables; if even the tables fail, the flag alone still
-    /// marks the totals.
+    /// from fresh tables and re-request the process rundown (missed
+    /// starts/stops re-materialize as ID-15 events, deduped on the row key);
+    /// if even the tables fail, the flag alone still marks the totals.
     fn rebaseline(self: *Engine) void {
+        self.session.captureState();
         const rows = tables.snapshotConnections(self.gpa) catch {
             self.core.flagRebaselined();
             return;

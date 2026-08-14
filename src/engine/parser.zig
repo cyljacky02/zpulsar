@@ -72,7 +72,7 @@ pub fn classify(id: u16) ?struct { op: event.Op, proto: event.Proto, family: eve
 /// packet. Verified live (issue #20): a two-process echo pair seeded from the
 /// tables kept exact connection counts under bidirectional traffic; a
 /// packet-oriented recv layout would have inserted phantom connections.
-pub fn parseV0(id: u16, user_data: []const u8, timestamp_qpc: i64) ?NetEvent {
+pub fn parseV0(id: u16, user_data: []const u8, timestamp_ft: i64) ?NetEvent {
     const class = classify(id) orelse return null;
 
     var out: NetEvent = .{
@@ -85,7 +85,7 @@ pub fn parseV0(id: u16, user_data: []const u8, timestamp_qpc: i64) ?NetEvent {
         .remote_addr = @splat(0),
         .local_port = undefined,
         .remote_port = undefined,
-        .timestamp_qpc = timestamp_qpc,
+        .timestamp_ft = timestamp_ft,
     };
 
     const addr_len: usize = switch (class.family) {
@@ -138,6 +138,8 @@ const remote_port: u16 = 443;
 const local_port: u16 = 51000;
 
 /// PID, size, daddr, saddr, dport, sport (+ per-id trailer the parser skips).
+/// Call at comptime only — a runtime call would return a pointer to a dead
+/// stack temporary.
 fn v4Payload(comptime trailer: []const u8) []const u8 {
     return &(le32(test_pid) ++ le32(test_size) ++ remote4 ++ local4 ++
         be16(remote_port) ++ be16(local_port) ++ trailer[0..trailer.len].*);
@@ -214,7 +216,7 @@ test "fixtures: every (id, v0) layout parses to its classification or to nothing
             try std.testing.expectEqual(exp.family, ev.family);
             try std.testing.expectEqual(exp.size, ev.size);
             try std.testing.expectEqual(test_pid, ev.pid);
-            try std.testing.expectEqual(@as(i64, 777), ev.timestamp_qpc);
+            try std.testing.expectEqual(@as(i64, 777), ev.timestamp_ft);
             // Ports come out in host order; addresses stay raw network bytes.
             try std.testing.expectEqual(remote_port, ev.remote_port);
             try std.testing.expectEqual(local_port, ev.local_port);
@@ -236,8 +238,8 @@ test "fixtures: every (id, v0) layout parses to its classification or to nothing
 }
 
 test "truncated payloads parse to nothing" {
-    const v4 = v4Payload(&seq_conn);
-    const v6 = v6Payload(&seq_conn);
+    const v4 = comptime v4Payload(&seq_conn);
+    const v6 = comptime v6Payload(&seq_conn);
     // One byte short of the last field the parser reads (sport end).
     try std.testing.expectEqual(@as(?NetEvent, null), parseV0(10, v4[0..19], 0));
     try std.testing.expectEqual(@as(?NetEvent, null), parseV0(27, v6[0..43], 0));

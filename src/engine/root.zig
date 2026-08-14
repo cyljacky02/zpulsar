@@ -6,9 +6,12 @@ const std = @import("std");
 
 pub const consumer = @import("consumer.zig");
 pub const core = @import("core.zig");
+pub const device_map = @import("device_map.zig");
 pub const etw_session = @import("etw_session.zig");
 pub const event = @import("event.zig");
 pub const parser = @import("parser.zig");
+pub const process_parser = @import("process_parser.zig");
+pub const process_tdh = @import("process_tdh.zig");
 pub const runner = @import("runner.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const spsc_ring = @import("spsc_ring.zig");

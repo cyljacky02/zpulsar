@@ -27,15 +27,55 @@ pub const NetEvent = struct {
     /// Host byte order.
     local_port: u16,
     remote_port: u16,
-    /// EVENT_HEADER.TimeStamp (QPC). Unused by the totals ticket; carried so
-    /// the ring record layout is final before the rates ticket.
-    timestamp_qpc: i64,
+    /// EVENT_HEADER.TimeStamp. The session clock is QPC, but the consumer
+    /// does not set PROCESS_TRACE_MODE_RAW_TIMESTAMP, so ETW delivers it
+    /// converted to FILETIME (docs/research/kernel-process-etw.md §3) —
+    /// directly comparable to ProcessEvent create/exit times.
+    timestamp_ft: i64,
 };
 
 comptime {
     // The ring is sized as 16 Ki x ~64 B (spec); keep the record within that.
     std.debug.assert(@sizeOf(NetEvent) <= 64);
 }
+
+/// Longest image name kept: an NT device prefix (`\Device\HarddiskVolumeNN\`,
+/// ~25 units) plus a MAX_PATH DOS path. Longer names truncate — a display
+/// concern only; the row key never involves the name.
+pub const max_image_name_units = 288;
+
+pub const ProcessKind = enum(u8) { start, stop, rundown };
+
+/// Fixed-size Kernel-Process record for the process ring
+/// (docs/research/kernel-process-etw.md). Process events are low-volume
+/// (tens/s worst case), so the inline name buffer is affordable and keeps the
+/// consumer thread allocation-free.
+pub const ProcessEvent = struct {
+    kind: ProcessKind,
+    pid: u32,
+    /// Raw payload CreateTime FILETIME — the other half of the Process Row
+    /// key (pid, create_time), bit-identical across start/stop/rundown.
+    create_time: u64,
+    /// Raw payload ExitTime FILETIME; stop events only, 0 otherwise.
+    exit_time: u64,
+    /// UTF-16 units of `name_buf` in use. Always 0 for stop events: the
+    /// stop-event name is ANSI and kernel-truncated — never displayed
+    /// (research §2.4).
+    name_len: u16,
+    /// Image name from start/rundown payloads: full NT device path, or a
+    /// bare name for kernel/minimal processes (System, Registry, …).
+    name_buf: [max_image_name_units]u16,
+
+    pub fn name(self: *const ProcessEvent) []const u16 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    pub fn setName(self: *ProcessEvent, units: []const u16) void {
+        const n = @min(units.len, max_image_name_units);
+        @memcpy(self.name_buf[0..n], units[0..n]);
+        self.name_len = @intCast(n);
+    }
+};
 
 /// Identity of one connection for cold-start reconciliation: events racing
 /// the table snapshot dedupe on this key (spec issue #18 "Cold start").
@@ -72,7 +112,7 @@ fn testEvent(proto: Proto) NetEvent {
         .remote_addr = [4]u8{ 93, 184, 216, 34 } ++ @as([12]u8, @splat(0)),
         .local_port = 51000,
         .remote_port = 443,
-        .timestamp_qpc = 0,
+        .timestamp_ft = 0,
     };
 }
 

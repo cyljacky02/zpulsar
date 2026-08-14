@@ -1,7 +1,8 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
-//! issue #20's tracer. Brings the `zPulsarNet` session up, runs the consumer
-//! and Engine threads, and renders a live per-PID In-session Totals table
-//! from acquired Snapshots, health flags included. Requires elevation.
+//! issue #20's tracer plus issue #21's Process Rows. Brings the `zPulsarNet`
+//! session up, runs the consumer and Engine threads, and renders a live
+//! per-process In-session Totals table from acquired Snapshots — real image
+//! names, dimmed "(exited)" rows, health flags. Requires elevation.
 //!
 //! Usage: zpulsar-headless [--duration <seconds>]
 //! Default runs until Ctrl+C.
@@ -114,7 +115,7 @@ fn writeTable(
 ) !void {
     if (vt) try w.writeAll("\x1b[H\x1b[J");
     try w.print(
-        "zPulsar headless — per-PID In-session Totals  (snapshot #{d}, up {d}s)\n",
+        "zPulsar headless — per-process In-session Totals  (snapshot #{d}, up {d}s)\n",
         .{ snap.seq, uptime_ms / 1000 },
     );
     try w.print("ring dropped: {d}   etw lost: {d}", .{
@@ -124,7 +125,7 @@ fn writeTable(
     if (snap.health.rebaselined)
         try w.writeAll("   [RE-BASELINED: loss occurred, totals may undercount]");
     try w.writeAll("\n\n");
-    try w.print("{s:>8}  {s:>4}  {s:>4}  {s:>12}  {s:>12}\n", .{ "PID", "TCP", "UDP", "SENT", "RECV" });
+    try w.print("{s:>8}  {s:>4}  {s:>4}  {s:>12}  {s:>12}  {s}\n", .{ "PID", "TCP", "UDP", "SENT", "RECV", "NAME" });
 
     // Busiest first; the Snapshot itself stays untouched (it is immutable —
     // sort a copy; on allocation failure fall back to PID order).
@@ -147,13 +148,19 @@ fn writeTable(
     var sent_buf: [16]u8 = undefined;
     var recv_buf: [16]u8 = undefined;
     for (rows[0..shown]) |r| {
-        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}\n", .{
+        if (r.exited and vt) try w.writeAll("\x1b[2m");
+        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s}{s}{s}", .{
             r.pid,
             r.tcp_conns,
             r.udp_socks,
             fmtBytes(r.sent, &sent_buf),
             fmtBytes(r.recv, &recv_buf),
+            if (r.name.len > max_name_display) "…" else "",
+            displayName(r.name),
+            if (r.exited) " (exited)" else "",
         });
+        if (r.exited and vt) try w.writeAll("\x1b[22m");
+        try w.writeAll("\n");
     }
     if (snap.rows.len > shown)
         try w.print("  … {d} more processes\n", .{snap.rows.len - shown});
@@ -165,9 +172,20 @@ fn writeTable(
 }
 
 const max_rows = 25;
+/// Names longer than this are left-truncated — the tail (the exe name) is
+/// the interesting part, and wrapping lines would break the in-place repaint.
+const max_name_display = 56;
 
 fn rowBusierThan(_: void, a: engine.snapshot.Row, b: engine.snapshot.Row) bool {
     return a.sent + a.recv > b.sent + b.recv;
+}
+
+/// The Snapshot's display path, bounded for one terminal line; "?" while the
+/// process has no identity yet (traffic racing the rundown, or event loss).
+fn displayName(name: []const u8) []const u8 {
+    if (name.len == 0) return "?";
+    if (name.len <= max_name_display) return name;
+    return name[name.len - max_name_display ..];
 }
 
 /// Decimal units per the spec's display rules (B/KB/MB/GB).
