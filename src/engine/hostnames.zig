@@ -10,13 +10,12 @@
 //!   2. **global** `address` — any process's observation, last writer wins.
 //!      Covers a Flow whose own process never queried (a helper resolved for
 //!      it, or the socket was handed over).
-//!   3. **hints** `address` — the startup resolver-cache snapshot and
-//!      reverse-lookup results. Not "the name the process resolved", so they
-//!      render dimmed; Microsoft's own guidance is that reverse lookups are
-//!      "inherently unreliable, and should be used only as a hint" (§7).
-//!      `noteHint(.., .cache, ..)` is the seam the resolver-cache snapshot
-//!      fills; the `MSFT_DnsClientCache` probe behind it is issue #34, and
-//!      until it lands pre-start names are covered by the reverse lane.
+//!   3. **hints** `address` — the startup resolver-cache snapshot
+//!      (dns_cache.zig, issue #34) and reverse-lookup results. Not "the name
+//!      the process resolved", so they render dimmed; Microsoft's own guidance
+//!      is that reverse lookups are "inherently unreliable, and should be used
+//!      only as a hint" (§7). Both fill the tier through `noteHint`, and
+//!      neither can displace an observation — they live in their own tier.
 //!
 //! A miss shows the bare endpoint. Alongside the tiers this owns the two
 //! pieces of state that keep the reverse-lookup lane honest: the negative
@@ -43,7 +42,10 @@ pub const Origin = enum(u8) { observed, cache, reverse };
 pub const Name = struct {
     text: []const u8,
     /// The CNAME chain's tail: the name the address actually belongs to, for
-    /// optional display. Empty for hints and for answers without a CNAME.
+    /// optional display. Empty for answers that went through no CNAME — and
+    /// always for reverse-lookup hints, which are one PTR record and have no
+    /// chain to report. Cache hints do carry one: the resolver cache records
+    /// the chain the same way a 3008 answer does.
     alias: []const u8 = "",
     origin: Origin,
 };

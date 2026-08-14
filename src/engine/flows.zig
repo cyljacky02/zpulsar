@@ -793,6 +793,44 @@ pub const Table = struct {
         return changed;
     }
 
+    /// Name every Flow still showing a bare endpoint from what the tiers
+    /// already hold — one walk of this table, asking the cache per Flow.
+    ///
+    /// `applyName` above is the shape for a *single* name arriving, and the
+    /// startup resolver-cache snapshot (issue #34) is the opposite case:
+    /// thousands of names at once, none of them prompted by a Flow. Calling
+    /// `applyName` per record would walk this whole table once per record —
+    /// the product of two caps, on the Engine thread, at startup, which is
+    /// precisely when the latency budget has least room.
+    ///
+    /// Flows that already carry a name are skipped: an observation is
+    /// permanent, and swapping one hint for another is churn the user cannot
+    /// act on (see `upgrade`).
+    pub fn nameFromTiers(
+        self: *Table,
+        gpa: std.mem.Allocator,
+        names: *hostnames.Table,
+        now_ms: u64,
+    ) error{OutOfMemory}!bool {
+        var changed = false;
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            const tuple = e.key_ptr.tuple;
+            if (isZeroRemote(tuple)) continue;
+            const l = &(e.value_ptr.live orelse continue);
+            if (l.name.text.len > 0) continue;
+            const found = names.lookup(e.key_ptr.pid, remoteOf(tuple), now_ms) orelse continue;
+            changed = try upgrade(gpa, &l.name, found) or changed;
+        }
+        for (self.linger.items[self.linger_head..]) |*l| {
+            if (isZeroRemote(l.key.tuple)) continue;
+            if (l.flow.name.text.len > 0) continue;
+            const found = names.lookup(l.key.pid, remoteOf(l.key.tuple), now_ms) orelse continue;
+            changed = try upgrade(gpa, &l.flow.name, found) or changed;
+        }
+        return changed;
+    }
+
     /// Whether a name for `ip` belongs on a Flow with this tuple.
     fn namesAddress(tuple: event.ConnKey, ip: event.IpAddr) bool {
         return !isZeroRemote(tuple) and std.meta.eql(remoteOf(tuple), ip);
