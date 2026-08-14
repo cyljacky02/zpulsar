@@ -169,7 +169,7 @@ fn writeTable(
         try w.print("{d:>8}  {d:>4}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}{s}{s}{s}", .{
             r.pid,
             r.tcp_conns,
-            r.udp_socks,
+            r.udp_flows,
             r.icmp_flows,
             fmtRate(r.recv_rate, &down_buf),
             fmtRate(r.sent_rate, &up_buf),
@@ -262,6 +262,7 @@ fn writeFlow(
     var dbuf: [20]u8 = undefined;
     var ubuf: [20]u8 = undefined;
     var svcbuf: [64]u8 = undefined;
+    var grpbuf: [64]u8 = undefined;
     const line_dim = vt and f.lingering;
     if (line_dim) try w.writeAll("\x1b[2m");
     try w.print("           {s} gen{d}  {s} -> {s}  ↓ {s} ↑ {s}  {s} / {s}", .{
@@ -274,6 +275,7 @@ fn writeFlow(
         fmtActivity(f, .sent, &sbuf),
         fmtActivity(f, .recv, &rvbuf),
     });
+    try w.writeAll(groupLabel(f, &grpbuf));
     try writeHostname(w, f, vt and !line_dim);
     try w.writeAll(flowServiceLabel(f, row, &svcbuf));
     if (f.lingering) try w.writeAll("  [linger]");
@@ -316,6 +318,24 @@ fn serviceLabel(r: engine.snapshot.Row, buf: []u8) []const u8 {
         w.writeAll(name) catch break;
     }
     w.writeByte(')') catch {};
+    return w.buffered();
+}
+
+/// The Group Address these datagrams arrived at (ADR-0004). Load-bearing, not
+/// decorative: it is the address vacated from the local endpoint, and without
+/// it a broadcast receive — whose local and remote can both be this machine —
+/// is inexplicable. Receive-only; a send addressed to a group already shows it
+/// as the remote endpoint, where it belongs.
+fn groupLabel(f: engine.snapshot.Flow, buf: []u8) []const u8 {
+    const kind = switch (f.group_kind) {
+        .none => return "",
+        .multicast => "mcast",
+        .broadcast => "bcast",
+    };
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("  [{s} ", .{kind}) catch return "";
+    writeAddr(&w, f.family, f.group_addr) catch return "";
+    w.writeByte(']') catch return "";
     return w.buffered();
 }
 
@@ -368,23 +388,27 @@ fn fmtEndpoint(f: engine.snapshot.Flow, side: Side, buf: []u8) []const u8 {
     };
     if (port == 0 and std.mem.allEqual(u8, &addr, 0)) return "*";
     const ported = f.proto != .icmp;
-    switch (f.family) {
-        .v4 => {
-            var w: std.Io.Writer = .fixed(buf);
-            w.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch return "?";
-            if (ported) w.print(":{d}", .{port}) catch return "?";
-            return w.buffered();
-        },
+    const bracket = ported and f.family == .v6;
+    var w: std.Io.Writer = .fixed(buf);
+    if (bracket) w.writeByte('[') catch return "?";
+    writeAddr(&w, f.family, addr) catch return "?";
+    if (bracket) w.writeByte(']') catch return "?";
+    if (ported) w.print(":{d}", .{port}) catch return "?";
+    return w.buffered();
+}
+
+/// A bare address: the inner half of every endpoint above, and the whole of a
+/// Group Address badge, which has no port of its own — the port is the
+/// socket's and is already on the local endpoint.
+fn writeAddr(w: *std.Io.Writer, family: engine.event.Family, addr: [16]u8) !void {
+    switch (family) {
+        .v4 => try w.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }),
         .v6 => {
-            var w: std.Io.Writer = .fixed(buf);
-            if (ported) w.writeByte('[') catch return "?";
             var i: usize = 0;
             while (i < 16) : (i += 2) {
-                if (i > 0) w.writeByte(':') catch return "?";
-                w.print("{x}", .{std.mem.readInt(u16, addr[i..][0..2], .big)}) catch return "?";
+                if (i > 0) try w.writeByte(':');
+                try w.print("{x}", .{std.mem.readInt(u16, addr[i..][0..2], .big)});
             }
-            if (ported) w.print("]:{d}", .{port}) catch return "?";
-            return w.buffered();
         },
     }
 }
