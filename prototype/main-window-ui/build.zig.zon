@@ -1,0 +1,18 @@
+.{
+    .name = .zpulsar_ui_prototype,
+    .version = "0.0.0",
+    .fingerprint = 0x963fcad718c7692e,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui#7c597c5564c3f55cdb876f5ea5a55bb7120cdef9",
+            .hash = "dvui-0.5.0-dev-AQFJmYBGAQFhUuXUS0U7WFjJ08PUmNUhuzUVr7x7JPZK",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "main.manifest",
+    },
+}
