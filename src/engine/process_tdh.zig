@@ -45,13 +45,7 @@ fn getFixed(comptime T: type, rec: *win32.EVENT_RECORD, comptime name: []const u
 fn readImageName(rec: *win32.EVENT_RECORD, out: *event.ProcessEvent) void {
     var buf: [4096]u8 = undefined;
     const size = getProperty(rec, "ImageName", &buf) orelse return;
-    var n: usize = 0;
-    while (2 * n + 1 < size and n < event.max_image_name_units) : (n += 1) {
-        const unit = std.mem.readInt(u16, buf[2 * n ..][0..2], .little);
-        if (unit == 0) break;
-        out.name_buf[n] = unit;
-    }
-    out.name_len = @intCast(n);
+    out.setNameFromUtf16leBytes(buf[0..size]);
 }
 
 /// One TdhGetPropertySize + TdhGetProperty round trip; null on any failure.

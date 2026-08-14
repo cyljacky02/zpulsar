@@ -75,6 +75,19 @@ pub const ProcessEvent = struct {
         @memcpy(self.name_buf[0..n], units[0..n]);
         self.name_len = @intCast(n);
     }
+
+    /// Copy a NUL-terminated UTF-16LE byte buffer (a raw payload tail or a
+    /// TDH property value, any alignment) into the record, stopping at the
+    /// buffer end and at capacity — truncation is a display concern only.
+    pub fn setNameFromUtf16leBytes(self: *ProcessEvent, bytes: []const u8) void {
+        var n: usize = 0;
+        while (2 * n + 1 < bytes.len and n < max_image_name_units) : (n += 1) {
+            const unit = std.mem.readInt(u16, bytes[2 * n ..][0..2], .little);
+            if (unit == 0) break;
+            self.name_buf[n] = unit;
+        }
+        self.name_len = @intCast(n);
+    }
 };
 
 /// Identity of one connection for cold-start reconciliation: events racing

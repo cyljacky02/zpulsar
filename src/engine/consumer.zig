@@ -134,13 +134,7 @@ pub const Consumer = struct {
         const ev = switch (process_parser.parse(desc.Id, desc.Version, userData(rec))) {
             .event => |ev| ev,
             .drop => return,
-            .unknown_version => self.process_fallback(rec, switch (desc.Id) {
-                process_parser.Id.process_start => .start,
-                process_parser.Id.process_stop => .stop,
-                process_parser.Id.process_rundown => .rundown,
-                // parse() classifies every other id as .drop.
-                else => unreachable,
-            }) orelse return,
+            .unknown_version => |kind| self.process_fallback(rec, kind) orelse return,
         };
         if (self.process_ring.push(ev) == .pushed_was_empty) self.wake.set();
     }

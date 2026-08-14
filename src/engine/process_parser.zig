@@ -28,8 +28,8 @@ pub const ParseResult = union(enum) {
     /// ProcessInPrivateSet) or a malformed/truncated payload.
     drop,
     /// An id we consume at a version we have no layout for — the caller
-    /// routes the record to the TDH fallback.
-    unknown_version,
+    /// routes the record, as this kind, to the TDH fallback.
+    unknown_version: event.ProcessKind,
 };
 
 pub fn parse(id: u16, version: u8, user_data: []const u8) ParseResult {
@@ -37,17 +37,17 @@ pub fn parse(id: u16, version: u8, user_data: []const u8) ParseResult {
         Id.process_start => switch (version) {
             2 => parseStartLike(.start, .fixed24, user_data),
             3, 4 => parseStartLike(.start, .sid_skip, user_data),
-            else => .unknown_version,
+            else => .{ .unknown_version = .start },
         },
         Id.process_rundown => switch (version) {
             0 => parseStartLike(.rundown, .fixed24, user_data),
             1, 2 => parseStartLike(.rundown, .sid_skip, user_data),
-            else => .unknown_version,
+            else => .{ .unknown_version = .rundown },
         },
         Id.process_stop => switch (version) {
             1 => parseStop(.{ .create_time = 4, .exit_time = 12 }, user_data),
             2 => parseStop(.{ .create_time = 12, .exit_time = 20 }, user_data),
-            else => .unknown_version,
+            else => .{ .unknown_version = .stop },
         },
         else => .drop,
     };
@@ -92,7 +92,9 @@ fn parseStartLike(
         },
     };
     if (user_data.len < name_off) return .drop;
-    readName(&out, user_data, name_off);
+    // The NUL-terminated UTF-16LE ImageName; a payload cut short of the NUL
+    // yields the readable prefix (defensive — the manifest guarantees it).
+    out.setNameFromUtf16leBytes(user_data[name_off..]);
     return .{ .event = out };
 }
 
@@ -109,21 +111,6 @@ fn parseStop(comptime off: StopOffsets, user_data: []const u8) ParseResult {
         .name_len = 0,
         .name_buf = undefined,
     } };
-}
-
-/// Copy the NUL-terminated UTF-16LE ImageName into the record, stopping at
-/// the payload end (defensive) and at the record's capacity (truncation is a
-/// display concern only).
-fn readName(out: *event.ProcessEvent, user_data: []const u8, name_off: usize) void {
-    var n: usize = 0;
-    var off = name_off;
-    while (off + 2 <= user_data.len and n < event.max_image_name_units) : (off += 2) {
-        const unit = std.mem.readInt(u16, user_data[off..][0..2], .little);
-        if (unit == 0) break;
-        out.name_buf[n] = unit;
-        n += 1;
-    }
-    out.name_len = @intCast(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,16 +261,17 @@ test "the truncated stop-event name is never read" {
 }
 
 test "unknown versions route to the TDH fallback, never to old offsets" {
-    const cases = [_]struct { id: u16, version: u8 }{
-        .{ .id = 1, .version = 5 }, // future
-        .{ .id = 2, .version = 3 },
-        .{ .id = 15, .version = 3 },
-        .{ .id = 1, .version = 1 }, // pre-1703, unreachable on 1809+ but honest
-        .{ .id = 2, .version = 0 },
+    const cases = [_]struct { id: u16, version: u8, kind: event.ProcessKind }{
+        .{ .id = 1, .version = 5, .kind = .start }, // future
+        .{ .id = 2, .version = 3, .kind = .stop },
+        .{ .id = 15, .version = 3, .kind = .rundown },
+        // Pre-1703, unreachable on 1809+ but honest.
+        .{ .id = 1, .version = 1, .kind = .start },
+        .{ .id = 2, .version = 0, .kind = .stop },
     };
     for (cases) |c| {
         try std.testing.expectEqual(
-            ParseResult.unknown_version,
+            ParseResult{ .unknown_version = c.kind },
             parse(c.id, c.version, start_v2_payload),
         );
     }

@@ -205,13 +205,14 @@ pub const Core = struct {
 
     /// Cold-start seed: insert table rows that no event has claimed yet.
     /// Events that raced the snapshot already sit in the map under the same
-    /// normalized key — that is the dedupe.
+    /// normalized key — that is the dedupe. Claimed keys are skipped before
+    /// any row lookup, so a table row disagreeing with the event's payload
+    /// PID cannot mint a ghost placeholder row.
     pub fn seed(self: *Core, rows: []const tables.SeededConn) error{OutOfMemory}!void {
         for (rows) |r| {
-            const idx = try self.rowForTraffic(r.pid, 0);
-            const before = self.conns.count();
-            try self.upsertConn(r.key, idx);
-            if (self.conns.count() != before) self.dirty = true;
+            if (self.conns.contains(r.key)) continue;
+            try self.conns.put(self.gpa, r.key, try self.rowForTraffic(r.pid, 0));
+            self.dirty = true;
         }
     }
 
@@ -232,7 +233,10 @@ pub const Core = struct {
     /// stay — the sticky flag marks them as possibly low.
     pub fn rebaseline(self: *Core, rows: []const tables.SeededConn) error{OutOfMemory}!void {
         self.conns.clearRetainingCapacity();
-        for (rows) |r| try self.upsertConn(r.key, try self.rowForTraffic(r.pid, 0));
+        for (rows) |r| {
+            if (self.conns.contains(r.key)) continue; // duplicate table rows
+            try self.conns.put(self.gpa, r.key, try self.rowForTraffic(r.pid, 0));
+        }
         self.flagRebaselined();
     }
 

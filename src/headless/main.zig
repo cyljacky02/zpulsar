@@ -185,7 +185,10 @@ fn rowBusierThan(_: void, a: engine.snapshot.Row, b: engine.snapshot.Row) bool {
 fn displayName(name: []const u8) []const u8 {
     if (name.len == 0) return "?";
     if (name.len <= max_name_display) return name;
-    return name[name.len - max_name_display ..];
+    var start = name.len - max_name_display;
+    // Never cut a multi-byte UTF-8 sequence in half.
+    while (start < name.len and name[start] & 0xC0 == 0x80) start += 1;
+    return name[start..];
 }
 
 /// Decimal units per the spec's display rules (B/KB/MB/GB).
