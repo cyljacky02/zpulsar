@@ -4,8 +4,17 @@
 
 const std = @import("std");
 
+pub const consumer = @import("consumer.zig");
+pub const core = @import("core.zig");
 pub const etw_session = @import("etw_session.zig");
+pub const event = @import("event.zig");
+pub const parser = @import("parser.zig");
+pub const runner = @import("runner.zig");
+pub const snapshot = @import("snapshot.zig");
+pub const spsc_ring = @import("spsc_ring.zig");
+pub const sync = @import("sync.zig");
 pub const tables = @import("tables.zig");
+pub const tdh = @import("tdh.zig");
 
 test {
     std.testing.refAllDecls(@This());

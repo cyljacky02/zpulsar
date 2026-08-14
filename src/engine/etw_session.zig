@@ -68,6 +68,27 @@ pub const Session = struct {
         buildControlProperties(&buf);
         _ = win32.ControlTraceW(self.handle, null, &buf.props, .STOP);
     }
+
+    /// The latency tick: deliver the session's partially filled buffers now.
+    /// Called every 100–150 ms so trickle traffic stays under the 200 ms
+    /// Attribution Latency budget (research §3.3).
+    pub fn flush(self: Session) void {
+        var buf: PropertiesBuffer = undefined;
+        buildControlProperties(&buf);
+        _ = win32.ControlTraceW(self.handle, null, &buf.props, .FLUSH);
+    }
+
+    /// Cumulative events the session lost, both channels: EventsLost (buffer
+    /// exhaustion at write time) plus RealTimeBuffersLost (buffers undeliverable
+    /// to the real-time consumer). Null when the query itself fails. Any
+    /// growth triggers the unified loss recovery.
+    pub fn queryEventsLost(self: Session) ?u64 {
+        var buf: PropertiesBuffer = undefined;
+        buildControlProperties(&buf);
+        if (win32.ControlTraceW(self.handle, null, &buf.props, .QUERY) != .NO_ERROR)
+            return null;
+        return @as(u64, buf.props.EventsLost) + buf.props.RealTimeBuffersLost;
+    }
 };
 
 /// Start the `zPulsarNet` session and enable Kernel-Network (IPv4|IPv6).
