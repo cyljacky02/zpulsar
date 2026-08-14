@@ -47,6 +47,18 @@ pub fn flowKey(ev: event.NetEvent) FlowKey {
     } };
 }
 
+/// How far Service Attribution (issue #25) has got with a Flow. The Flow
+/// layer only stores this; which tier applies is core.zig's decision.
+pub const Resolution = enum {
+    /// No service map has covered the owning process instance yet.
+    unclassified,
+    /// A per-socket owner-module lookup is in flight on the resolver lane.
+    pending,
+    /// Nothing more will be asked: the answer landed, failed, or was never
+    /// needed (the map alone settles single-service and non-service hosts).
+    settled,
+};
+
 /// A Flow's remote name, resolved once at creation and stored here rather
 /// than re-derived per repaint (spec issue #18; research §5). Empty text means
 /// the Flow shows its bare endpoint. Strings are owned by the Table.
@@ -80,7 +92,7 @@ const FlowName = struct {
     }
 };
 
-const Live = struct {
+pub const Live = struct {
     generation: u32,
     /// Owning Process Row instance (core.zig row index), bound at open —
     /// a Flow never migrates between Process Rows.
@@ -93,6 +105,10 @@ const Live = struct {
     /// When the Flow opened — what the reverse-lookup grace is measured from.
     opened_ms: u64,
     name: FlowName = .{},
+    resolution: Resolution = .unclassified,
+    /// The service that owns this socket, resolved per-socket (tier 2).
+    /// Interned by core.zig, so it outlives every service map.
+    service: ?[]const u8 = null,
 };
 
 /// One key's history: the current live Flow (if any), how many closed
@@ -250,13 +266,13 @@ pub const Table = struct {
         row: u32,
         now_ms: u64,
         names: *hostnames.Table,
-    ) error{OutOfMemory}!void {
+    ) error{OutOfMemory}!*Live {
         if (self.slots.getPtr(key)) |slot| {
             if (slot.live) |l| {
                 if (l.sent + l.recv > 0) _ = try self.close(gpa, key, now_ms);
             }
         }
-        _ = try self.touch(gpa, key, row, now_ms, names);
+        return self.touch(gpa, key, row, now_ms, names);
     }
 
     /// A real per-remote conversation supersedes the socket's table-seeded
@@ -557,6 +573,57 @@ pub const Table = struct {
         return changed;
     }
 
+    /// Apply a per-socket resolution to one Generation. What the module name
+    /// denotes is core.zig's call — it holds the service map — so this asks
+    /// `ctx.serviceNamed(row, module)` once the owning row is known, then
+    /// stores whatever comes back (null = no service could be named).
+    ///
+    /// The Flow stops asking either way: the answer is as good as it gets,
+    /// and a failed lookup leaves the honest fallback standing rather than
+    /// retrying against a table row that is already gone. False when the Flow
+    /// no longer exists — which is how an answer nobody can see anymore is
+    /// dropped.
+    pub fn applyOwnerModule(
+        self: *Table,
+        key: FlowKey,
+        generation: u32,
+        module: ?[]const u8,
+        ctx: anytype,
+    ) bool {
+        const slot = self.slots.getPtr(key) orelse return false;
+        if (slot.live) |*l| {
+            if (l.generation == generation) {
+                l.service = if (module) |m| ctx.serviceNamed(l.row, m) else null;
+                l.resolution = .settled;
+                return true;
+            }
+        }
+        // Closed while the lookup was in flight: it still shows for its
+        // Linger window, so the label is still worth having.
+        if (slot.linger_count == 0) return false;
+        for (self.linger.items[self.linger_head..]) |*l| {
+            if (l.flow.generation == generation and std.meta.eql(l.key, key)) {
+                l.flow.service = if (module) |m| ctx.serviceNamed(l.flow.row, m) else null;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Hand every live Flow still awaiting its Service Attribution tier
+    /// decision to `ctx.classify(key, live)`. Run when a fresh service map
+    /// lands: a Flow that opened before any map could describe its process
+    /// gets its decision then.
+    pub fn eachUnclassified(self: *Table, ctx: anytype) void {
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.live) |*l| {
+                if (l.resolution != .unclassified) continue;
+                ctx.classify(e.key_ptr.*, l);
+            }
+        }
+    }
+
     /// A name landed for `ip`: upgrade every visible Flow to that address in
     /// place, live and Lingering alike (spec issue #18: "a later observation
     /// upgrades it in place, and un-dims it"). True if anything changed.
@@ -689,6 +756,9 @@ pub const Table = struct {
                 .remote_hostname = if (name.text.len > 0) name.text else null,
                 .remote_alias = if (name.alias.len > 0) name.alias else null,
                 .hostname_origin = name.origin,
+                // Interned by core.zig, and copied into the arena alongside
+                // the names above.
+                .service = flow.service,
             },
         };
     }

@@ -6,16 +6,20 @@
 //! (flows.zig, issue #22) hangs each row's Flows beneath it: Flows bind to
 //! their owning row instance at open, close into Linger on disconnect,
 //! age-out, sweep, or process exit, and reconcile against IP Helper
-//! snapshots. The unified loss recovery — ring overflow and ETW EventsLost
-//! both re-baseline from fresh tables and set the sticky health flag.
-//! Totals are honest or marked, never silently low. Rates (issue #23) ride
-//! alongside: every byte is bucketed twice at event time, once on its Flow
-//! and once on its Row, so a Row's speed outlives its Flows. The memory
-//! caps run on the same tick — Flows at flows.cap, exited rows at
-//! `exited_row_cap` — and both obey the one rule that matters: eviction may
-//! coarsen attribution, never lose bytes. All lifecycle timing runs on the
-//! caller's monotonic `now_ms` so the whole layer is drivable by synthetic
-//! clocks.
+//! snapshots. Service Attribution (issue #25) is the tier policy here: rows
+//! learn what services they host from SCM maps the resolver lane delivers,
+//! Flows are classified the moment they open, and per-socket answers arrive
+//! later as completions. Core never blocks on a lookup — it posts requests to
+//! an outbox and applies whatever comes back. The unified loss recovery —
+//! ring overflow and ETW EventsLost both re-baseline from fresh tables and
+//! set the sticky health flag. Totals are honest or marked, never silently
+//! low. Rates (issue #23) ride alongside: every byte is bucketed twice at
+//! event time, once on its Flow and once on its Row, so a Row's speed
+//! outlives its Flows. The memory caps run on the same tick — Flows at
+//! flows.cap, exited rows at `exited_row_cap` — and both obey the one rule
+//! that matters: eviction may coarsen attribution, never lose bytes. All
+//! lifecycle timing runs on the caller's monotonic `now_ms` so the whole
+//! layer is drivable by synthetic clocks.
 
 const std = @import("std");
 const device_map = @import("device_map.zig");
@@ -23,9 +27,73 @@ const event = @import("event.zig");
 const flows = @import("flows.zig");
 const hostnames = @import("hostnames.zig");
 const rates = @import("rates.zig");
+const resolver = @import("resolver.zig");
 const reverse_lookup = @import("reverse_lookup.zig");
+const service_map = @import("service_map.zig");
 const snapshot = @import("snapshot.zig");
+const strings = @import("strings.zig");
+const sync = @import("sync.zig");
 const tables = @import("tables.zig");
+
+/// What the SCM map says about a process instance. `unknown` is the honest
+/// third state: no map has covered this instance yet, so we know neither that
+/// it hosts services nor that it doesn't.
+const ServiceState = enum { unknown, none, hosted };
+
+/// When the Engine is allowed to re-enumerate the SCM. Refresh is
+/// demand-driven rather than polled: a Flow opening on a process no map can
+/// describe is the service state change we care about, and Windows offers no
+/// cheap notification for the rest. An idle machine starts no processes, so
+/// it enumerates nothing at all — which is what keeps this inside the idle
+/// CPU budget.
+const MapRefresh = struct {
+    /// A request is out; a second would enumerate the same SCM twice.
+    in_flight: bool = false,
+    ever_requested: bool = false,
+    last_request_ms: u64 = 0,
+    /// When the newest map was installed — the staleness clock.
+    installed_ms: u64 = 0,
+
+    /// Floor between enumerations, so a burst of new processes cannot turn
+    /// demand-driven refresh into a busy loop.
+    const min_interval_ms: u64 = 2_000;
+    /// How stale a shared host's hosted-service list may get. A service
+    /// stopping inside a host that keeps running produces no process event
+    /// and no Flow on an unknown PID, so nothing else would ever notice it.
+    const ttl_ms: u64 = 30_000;
+    /// How long a request may be outstanding before another is allowed. Both
+    /// queues drop work when full, and an answer dropped on the way back
+    /// would otherwise leave the map "in flight" — and so never refreshed —
+    /// for the rest of the session.
+    const request_timeout_ms: u64 = 30_000;
+
+    /// May the Engine ask now? Clears a request whose answer is never coming.
+    fn due(self: *MapRefresh, now_ms: u64) bool {
+        if (self.in_flight) {
+            if (now_ms -| self.last_request_ms < request_timeout_ms) return false;
+            self.in_flight = false;
+        }
+        // The very first request skips the floor: cold start has no map.
+        return !self.ever_requested or
+            now_ms -| self.last_request_ms >= min_interval_ms;
+    }
+
+    fn sent(self: *MapRefresh, now_ms: u64) void {
+        self.in_flight = true;
+        self.ever_requested = true;
+        self.last_request_ms = now_ms;
+    }
+
+    /// The map in hand is old enough that a shared host's list may have
+    /// drifted from what the SCM now says.
+    fn stale(self: *const MapRefresh, now_ms: u64) bool {
+        return now_ms -| self.installed_ms >= ttl_ms;
+    }
+};
+/// Ceiling on undrained resolver work. Past it, new Flows keep the honest
+/// fallback instead of growing the queue — the label is worth less than the
+/// bound.
+const outbox_cap: usize = 512;
 
 /// The exited-row cap (spec issue #18 Data model, "Memory bounds"): at most
 /// this many exited Process Rows stay individually visible. Live rows are
@@ -64,6 +132,14 @@ const ProcessRow = struct {
     /// This is the Evicted-processes Row (CONTEXT.md): where the totals of
     /// exited rows the cap took land. Never a PID, never a victim.
     evicted_processes: bool = false,
+    /// Service Attribution tier 1 (issue #25): the services this instance
+    /// hosts, sorted. The slice is owned by Core's gpa; the names are interned
+    /// and outlive every map. Set only from a map that was captured after the
+    /// instance started, which is what makes it immune to PID reuse — and
+    /// frozen at exit, so an exited service host keeps its identity for the
+    /// rest of the session even though the SCM has long forgotten it.
+    services: []const []const u8 = &.{},
+    service_state: ServiceState = .unknown,
 };
 
 pub const Core = struct {
@@ -96,13 +172,25 @@ pub const Core = struct {
     /// Scratch reverse-lookup candidate list, reused across maintenance passes.
     reverse_scratch: std.ArrayList(event.IpAddr) = .empty,
     last_name_maintenance_ms: u64 = 0,
+    /// Service names, interned for the session (issue #25): rows and Flows
+    /// reference these, so replacing a service map can never dangle a label.
+    /// Distinct from `names` above, which caches remote *host* names.
+    service_names: strings.Pool = .{},
+    /// Work for the metadata resolver lane, drained and submitted by the
+    /// runner. Core never blocks on a lookup — it only ever asks.
+    outbox: std.ArrayList(resolver.Request) = .empty,
+    /// When the Engine may next re-enumerate the SCM.
+    map_refresh: MapRefresh = .{},
 
     pub fn init(gpa: std.mem.Allocator) Core {
         return .{ .gpa = gpa };
     }
 
     pub fn deinit(self: *Core) void {
-        for (self.rows.items) |row| self.gpa.free(row.name);
+        for (self.rows.items) |row| {
+            self.gpa.free(row.name);
+            self.gpa.free(row.services);
+        }
         self.rows.deinit(self.gpa);
         self.live_by_pid.deinit(self.gpa);
         self.exited_by_pid.deinit(self.gpa);
@@ -111,6 +199,8 @@ pub const Core = struct {
         self.drive_map.deinit(self.gpa);
         self.flow_scratch.deinit(self.gpa);
         self.reverse_scratch.deinit(self.gpa);
+        self.service_names.deinit(self.gpa);
+        self.outbox.deinit(self.gpa);
     }
 
     /// Apply one net-event ring record. OOM drops the record — the caller
@@ -134,9 +224,10 @@ pub const Core = struct {
                 row.rate.add(at, sent, recv);
                 // First activity opens the Flow (raced the table snapshot,
                 // or a new Generation after closure).
+                const key = flows.flowKey(ev);
                 const live = try self.flows.touch(
                     self.gpa,
-                    flows.flowKey(ev),
+                    key,
                     idx,
                     now_ms,
                     &self.names,
@@ -144,11 +235,14 @@ pub const Core = struct {
                 live.sent += sent;
                 live.recv += recv;
                 live.rate.add(at, sent, recv);
+                if (live.resolution == .unclassified) self.classify(key, live, now_ms);
                 self.dirty = true;
             },
             .connect => {
                 const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
-                try self.flows.connect(self.gpa, flows.flowKey(ev), idx, now_ms, &self.names);
+                const key = flows.flowKey(ev);
+                const live = try self.flows.connect(self.gpa, key, idx, now_ms, &self.names);
+                if (live.resolution == .unclassified) self.classify(key, live, now_ms);
                 self.dirty = true;
             },
             .disconnect => {
@@ -276,6 +370,185 @@ pub const Core = struct {
         var buf: [3 * event.max_image_name_units]u8 = undefined;
         const n = std.unicode.wtf16LeToWtf8(&buf, ev.name());
         self.rows.items[idx].name = try self.drive_map.displayPath(self.gpa, buf[0..n]);
+    }
+
+    /// Service Attribution's per-Flow tier decision (issue #25), taken the
+    /// moment a Flow opens. Eagerly, because tier 2 needs the socket's
+    /// owner-table row to still be there, and a short-lived socket in a shared
+    /// host leaves that table fast. Nothing here blocks: the decision is
+    /// either free (tiers 1 and 3, from the map already in hand) or a request
+    /// posted to the resolver lane.
+    fn classify(self: *Core, key: flows.FlowKey, live: *flows.Live, now_ms: u64) void {
+        const row = &self.rows.items[live.row];
+        switch (row.service_state) {
+            // No map covers this instance yet — ask for one and leave the Flow
+            // unclassified; the map's arrival takes the decision. A
+            // placeholder row is the exception: with no CreateTime there is
+            // nothing to key a map against, so no enumeration could settle it
+            // and asking for one every time it sends would be pure waste.
+            // The Kernel-Process event that names it is what unblocks this.
+            .unknown => if (row.create_time != 0) self.requestServiceMap(now_ms),
+            // Permanent: the SCM assigns a process its services when it
+            // starts, so one that hosts none never begins to. A host gaining
+            // or losing a service is the `.hosted` staleness case below.
+            .none => live.resolution = .settled,
+            .hosted => {
+                if (self.map_refresh.stale(now_ms))
+                    self.requestServiceMap(now_ms);
+                // Tier 1: one service means the row *is* that service, and
+                // buildSnapshot names the Flow from it — no lookup at all.
+                if (row.services.len < 2) {
+                    live.resolution = .settled;
+                    return;
+                }
+                live.resolution = if (self.postRequest(.{ .owner_module = .{
+                    .key = key,
+                    .generation = live.generation,
+                    .create_time = row.create_time,
+                } })) .pending else .settled;
+            },
+        }
+    }
+
+    /// Post work to the resolver lane. False when the outbox is full: the
+    /// caller must fall back rather than retry.
+    fn postRequest(self: *Core, req: resolver.Request) bool {
+        if (self.outbox.items.len >= outbox_cap) {
+            self.health.service_lookups_dropped += 1;
+            return false;
+        }
+        self.outbox.append(self.gpa, req) catch {
+            self.health.service_lookups_dropped += 1;
+            return false;
+        };
+        return true;
+    }
+
+    /// Ask for a fresh SCM enumeration, if the refresh policy allows one now.
+    /// Also the Engine's startup prime, so the map is warm before the first
+    /// Flow needs it.
+    pub fn requestServiceMap(self: *Core, now_ms: u64) void {
+        if (!self.map_refresh.due(now_ms)) return;
+        if (!self.postRequest(.service_map)) return;
+        self.map_refresh.sent(now_ms);
+    }
+
+    /// Hand queued work to the resolver lane and clear the outbox. Work the
+    /// lane cannot take is dropped: the affected Flows keep the honest
+    /// fallback rather than the Engine growing a queue behind a busy lane.
+    pub fn submitOutbox(self: *Core, lane: *resolver.Lane) void {
+        for (self.outbox.items) |req| {
+            if (lane.submit(req)) continue;
+            self.health.service_lookups_dropped += 1;
+            // Same reasoning as the timeout above, immediately: a dropped map
+            // request has no answer coming, so stop waiting for one.
+            if (req == .service_map) self.map_refresh.in_flight = false;
+        }
+        self.outbox.clearRetainingCapacity();
+    }
+
+    /// Drain everything the resolver lane has finished. Non-blocking by
+    /// construction — the Engine thread never waits on a lookup.
+    pub fn drainCompletions(self: *Core, lane: *resolver.Lane, now_ms: u64) void {
+        while (lane.nextCompletion()) |completion| self.applyCompletion(completion, now_ms);
+    }
+
+    /// Apply one finished metadata-resolver lookup (issue #25). Always
+    /// consumes the completion's payload — and cannot fail, so no caller ever
+    /// has to reason about a half-consumed one.
+    pub fn applyCompletion(
+        self: *Core,
+        completion: resolver.Completion,
+        now_ms: u64,
+    ) void {
+        switch (completion) {
+            .service_map => |maybe_raw| {
+                self.map_refresh.in_flight = false;
+                const raw = maybe_raw orelse return; // query failed: keep what we have
+                defer raw.deinit(self.gpa);
+                self.installServiceMap(raw);
+                self.map_refresh.installed_ms = now_ms;
+                // Flows that opened before any map could describe their
+                // process get their tier decision now.
+                self.flows.eachUnclassified(Classifier{ .core = self, .now_ms = now_ms });
+                self.dirty = true;
+            },
+            .owner_module => |result| {
+                defer if (result.module) |m| self.gpa.free(m);
+                if (self.flows.applyOwnerModule(
+                    result.key,
+                    result.generation,
+                    result.module,
+                    Namer{ .core = self },
+                )) self.dirty = true;
+            },
+        }
+    }
+
+    /// The row's hosted service whose name the owner module matches, or null.
+    /// The API may answer with the host image ("svchost.exe") or a component
+    /// ("timer.dll") instead of a service (research §5 case 3); checking the
+    /// answer against what the SCM says the process actually hosts is what
+    /// keeps those from being displayed as services. Matching is
+    /// case-insensitive, and the SCM's spelling is the one shown.
+    fn hostedServiceNamed(self: *Core, row_idx: u32, module: []const u8) ?[]const u8 {
+        for (self.rows.items[row_idx].services) |name| {
+            if (std.ascii.eqlIgnoreCase(name, module)) return name;
+        }
+        return null;
+    }
+
+    /// `flows.applyOwnerModule` callback: turns a resolved module name into
+    /// one of the owning row's hosted services, or nothing.
+    const Namer = struct {
+        core: *Core,
+
+        pub fn serviceNamed(self: Namer, row: u32, module: []const u8) ?[]const u8 {
+            return self.core.hostedServiceNamed(row, module);
+        }
+    };
+
+    /// `flows.eachUnclassified` callback: re-takes the tier decision at a
+    /// fixed instant for every Flow still waiting on one.
+    const Classifier = struct {
+        core: *Core,
+        now_ms: u64,
+
+        pub fn classify(self: Classifier, key: flows.FlowKey, live: *flows.Live) void {
+            self.core.classify(key, live, self.now_ms);
+        }
+    };
+
+    /// Fold a fresh SCM enumeration into the Process Rows. Only instances the
+    /// map is entitled to describe are touched: one that started at or after
+    /// the capture may be a *different* process wearing a recycled PID
+    /// (research §4), and an exited one keeps whatever it had — its services
+    /// are history now, not something the SCM still knows.
+    fn installServiceMap(self: *Core, raw: *service_map.Raw) void {
+        std.mem.sort(service_map.Pair, raw.entries, {}, service_map.pairLessThan);
+        for (self.rows.items) |*row| {
+            if (row.exited) continue;
+            if (row.create_time == 0 or row.create_time >= raw.captured_ft) continue;
+            const hosted = service_map.servicesFor(raw.entries, row.pid);
+            if (hosted.len == 0) {
+                self.gpa.free(row.services);
+                row.services = &.{};
+                row.service_state = .none;
+                continue;
+            }
+            // Best-effort: a row that cannot be updated keeps its previous
+            // (or unknown) state and settles on the next map.
+            const list = self.gpa.alloc([]const u8, hosted.len) catch continue;
+            for (hosted, list) |src, *dst| {
+                dst.* = self.service_names.intern(self.gpa, src.name) catch {
+                    self.gpa.free(list);
+                    return;
+                };
+            }
+            self.gpa.free(row.services);
+            row.services = list;
+            row.service_state = .hosted;
+        }
     }
 
     /// Apply one accepted DNS-Client 3008 record: the name this process
@@ -435,6 +708,9 @@ pub const Core = struct {
         for (self.rows.items, 0..) |row, idx| {
             if (map[idx] == flows.removed_row) {
                 self.gpa.free(row.name);
+                // The names inside are interned and stay; the list itself is
+                // this row's own allocation and dies with it.
+                self.gpa.free(row.services);
                 continue;
             }
             self.rows.items[w] = row;
@@ -489,7 +765,11 @@ pub const Core = struct {
         rows: []const tables.SeededConn,
         now_ms: u64,
     ) error{OutOfMemory}!void {
-        if (try self.flows.reconcile(self.gpa, rows, self, now_ms, &self.names)) self.dirty = true;
+        if (try self.flows.reconcile(self.gpa, rows, self, now_ms, &self.names))
+            self.dirty = true;
+        // Connections that predate zPulsar deserve their service too, and at
+        // cold start this is what first asks for a map at all.
+        self.flows.eachUnclassified(Classifier{ .core = self, .now_ms = now_ms });
     }
 
     /// Compare cumulative loss counters against the last observed values.
@@ -563,6 +843,7 @@ pub const Core = struct {
                 .recv = row.recv,
                 .sent_rate = speed.sent,
                 .recv_rate = speed.recv,
+                .services = try snapshot.arenaDupeStrings(snap, row.services),
             };
         }
         // Flows address rows by position — attach spans and count live
@@ -581,10 +862,22 @@ pub const Core = struct {
             const start = fi;
             const row_idx = self.flow_scratch.items[fi].row;
             const dst = &out[row_idx];
+            // Service Attribution tier 1: a host running exactly one service
+            // *is* that service, so every Flow beneath it carries the name
+            // with no per-socket call. Shared hosts leave it to tier 2.
+            const only_service: ?[]const u8 =
+                if (dst.services.len == 1) dst.services[0] else null;
             while (fi < self.flow_scratch.items.len and
                 self.flow_scratch.items[fi].row == row_idx) : (fi += 1)
             {
                 const f = self.flow_scratch.items[fi].flow;
+                // A tier-2 name is interned in Core, so it has to be copied
+                // in like the row's names are: a Snapshot outlives nothing it
+                // shows. The tier-1 name is already the row's arena copy.
+                flat[fi].service = if (f.service) |name|
+                    try snapshot.arenaDupe(snap, name)
+                else
+                    only_service;
                 if (!f.lingering) switch (f.proto) {
                     .tcp => dst.tcp_conns += 1,
                     .udp => dst.udp_socks += 1,
@@ -1271,6 +1564,467 @@ test "process exit closes its live Flows into normal Linger" {
 }
 
 // ---------------------------------------------------------------------------
+// Service Attribution (issue #25) — driven through the same seam: parsed
+// records and resolver completions in, published Snapshots out.
+// ---------------------------------------------------------------------------
+
+test "a single-service host's Flows attribute to that service by the map alone" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    // The host process exists before the SCM enumeration that describes it.
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(
+        gpa,
+        200,
+        &.{.{ .pid = 900, .name = "Dnscache" }},
+    ) }, 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 900).?;
+    try std.testing.expectEqual(@as(usize, 1), row.services.len);
+    try std.testing.expectEqualStrings("Dnscache", row.services[0]);
+    // Tier 1: a single-service PID needs no per-socket call at all.
+    try std.testing.expectEqualStrings("Dnscache", row.flows[0].service.?);
+}
+
+test "a shared host's Flows fall back to the hosted-service list, never a guess" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    // The RPC pair: deliberately grouped by Windows, so this host stays
+    // shared even on a split machine (research §1).
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "RpcSs" },
+        .{ .pid = 900, .name = "RpcEptMapper" },
+    }) }, 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 900).?;
+    // The UI composes "svchost.exe (2 services)" from exactly this.
+    try std.testing.expectEqual(@as(usize, 2), row.services.len);
+    try std.testing.expectEqualStrings("RpcEptMapper", row.services[0]);
+    try std.testing.expectEqualStrings("RpcSs", row.services[1]);
+    // Two candidates and no per-socket answer yet: naming one would be a
+    // guess, so the Flow names none.
+    try std.testing.expectEqual(@as(?[]const u8, null), row.flows[0].service);
+}
+
+test "a map captured before a process started never describes it" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    // The PID's previous holder hosted Dnscache; this instance started after
+    // the enumeration, so the entry may describe a process that is long gone.
+    try core.applyProcess(procEvent(.rundown, 900, 300, 0, "\\x\\evil.exe"), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(
+        gpa,
+        200,
+        &.{.{ .pid = 900, .name = "Dnscache" }},
+    ) }, 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 900).?;
+    try std.testing.expectEqual(@as(usize, 0), row.services.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), row.flows[0].service);
+}
+
+test "an exited service host keeps its services after the SCM forgets it" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    try core.applyEvent(testEvent(.send, .tcp, 900, 40, 51000), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(
+        gpa,
+        200,
+        &.{.{ .pid = 900, .name = "Dnscache" }},
+    ) }, 0);
+    try core.applyProcess(procEvent(.stop, 900, 100, 400, ""), 1000);
+
+    // A later enumeration no longer lists the PID at all — the exited row is
+    // history, and must keep the identity its bytes were attributed under.
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 500, &.{}) }, 2000);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 900).?;
+    try std.testing.expect(row.exited);
+    try std.testing.expectEqual(@as(usize, 1), row.services.len);
+    try std.testing.expectEqualStrings("Dnscache", row.services[0]);
+    try std.testing.expectEqual(@as(u64, 40), row.sent);
+}
+
+/// The one owner-module request the Engine put in its outbox, or null.
+fn onlyOwnerRequest(core: *Core) ?resolver.OwnerQuery {
+    var found: ?resolver.OwnerQuery = null;
+    for (core.outbox.items) |req| switch (req) {
+        .owner_module => |q| {
+            if (found != null) return null; // more than one: the caller's assert fails
+            found = q;
+        },
+        else => {},
+    };
+    return found;
+}
+
+test "a shared host's Flow shows the fallback at once and upgrades in place" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "RpcSs" },
+        .{ .pid = 900, .name = "RpcEptMapper" },
+    }) }, 0);
+
+    const ev = testEvent(.connect, .tcp, 900, 0, 51000);
+    try core.applyEvent(ev, 1000);
+
+    // Resolution is asked for the moment the Flow opens — the owner-table row
+    // must still exist, and a short-lived socket leaves it fast.
+    const query = onlyOwnerRequest(&core).?;
+    try std.testing.expectEqual(@as(u32, 900), query.key.pid);
+    try std.testing.expectEqual(@as(u16, 51000), query.key.tuple.local_port);
+    try std.testing.expectEqual(@as(u32, 1), query.generation);
+    try std.testing.expectEqual(@as(u64, 100), query.create_time);
+
+    // Meanwhile the Flow is already visible, under the honest fallback.
+    const before = try core.buildSnapshot(0);
+    defer before.release();
+    const early = rowForPid(before.rows, 900).?.flows[0];
+    try std.testing.expectEqual(@as(?[]const u8, null), early.service);
+    try std.testing.expectEqual(@as(u32, 1), early.generation);
+
+    // The lane answers: the same Flow gains its service, in place.
+    core.applyCompletion(.{ .owner_module = .{
+        .key = query.key,
+        .generation = query.generation,
+        .module = try gpa.dupe(u8, "RpcSs"),
+    } }, 1500);
+
+    const after = try core.buildSnapshot(0);
+    defer after.release();
+    const row = rowForPid(after.rows, 900).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expectEqual(@as(u32, 1), row.flows[0].generation);
+    try std.testing.expectEqualStrings("RpcSs", row.flows[0].service.?);
+    // The host still lists both services — the row is a shared host either way.
+    try std.testing.expectEqual(@as(usize, 2), row.services.len);
+}
+
+test "a module name that is not one of the hosted services resolves to nothing" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "RpcSs" },
+        .{ .pid = 900, .name = "RpcEptMapper" },
+    }) }, 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 1000);
+    const query = onlyOwnerRequest(&core).?;
+
+    // The API may return a component or the host image instead of a service
+    // (research §5 case 3) — neither names a service, so neither is shown.
+    core.applyCompletion(.{ .owner_module = .{
+        .key = query.key,
+        .generation = query.generation,
+        .module = try gpa.dupe(u8, "svchost.exe"),
+    } }, 1500);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        rowForPid(snap.rows, 900).?.flows[0].service,
+    );
+}
+
+test "a resolved service survives the Flow closing into Linger" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "RpcSs" },
+        .{ .pid = 900, .name = "RpcEptMapper" },
+    }) }, 0);
+    const data = testEvent(.send, .tcp, 900, 99, 51000);
+    try core.applyEvent(data, 1000);
+    const query = onlyOwnerRequest(&core).?;
+    core.applyCompletion(.{ .owner_module = .{
+        .key = query.key,
+        .generation = query.generation,
+        .module = try gpa.dupe(u8, "RpcEptMapper"),
+    } }, 1100);
+
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 2000);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const f = rowForPid(snap.rows, 900).?.flows[0];
+    try std.testing.expect(f.lingering);
+    try std.testing.expectEqualStrings("RpcEptMapper", f.service.?);
+}
+
+test "a Flow that opened before any service map is classified when one lands" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    // A service that had only just started when its first socket appeared:
+    // no map covers it yet, so the Engine asks for one and shows the Flow.
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 0);
+    try std.testing.expect(core.outbox.items.len == 1);
+    try std.testing.expectEqual(resolver.Request.service_map, core.outbox.items[0]);
+    try std.testing.expectEqual(@as(?resolver.OwnerQuery, null), onlyOwnerRequest(&core));
+
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "RpcSs" },
+        .{ .pid = 900, .name = "RpcEptMapper" },
+    }) }, 100);
+
+    // The map's arrival takes the tier decision the Flow was waiting for.
+    const query = onlyOwnerRequest(&core).?;
+    try std.testing.expectEqual(@as(u16, 51000), query.key.tuple.local_port);
+}
+
+test "Flows of processes that host no services ask the lane for nothing" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 700, 100, 0, "\\x\\browser.exe"), 0);
+    try core.applyProcess(procEvent(.rundown, 800, 100, 0, "\\x\\svchost.exe"), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(
+        gpa,
+        200,
+        &.{.{ .pid = 800, .name = "Dnscache" }},
+    ) }, 0);
+
+    // A plain process, and a host running exactly one service: the map alone
+    // settles both, so no per-socket call is ever made.
+    try core.applyEvent(testEvent(.connect, .tcp, 700, 0, 51000), 1000);
+    try core.applyEvent(testEvent(.connect, .tcp, 800, 0, 51001), 1000);
+    try std.testing.expectEqual(@as(?resolver.OwnerQuery, null), onlyOwnerRequest(&core));
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        rowForPid(snap.rows, 700).?.flows[0].service,
+    );
+    try std.testing.expectEqualStrings(
+        "Dnscache",
+        rowForPid(snap.rows, 800).?.flows[0].service.?,
+    );
+}
+
+test "a connection that predates zPulsar gets its service attributed too" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+
+    // Cold start: the owner table seeds a shared host's existing connection.
+    const ev = testEvent(.connect, .tcp, 900, 0, 51000);
+    try core.reconcile(&.{.{ .pid = 900, .key = event.connKey(ev) }}, 0);
+    // Nothing yet knows what PID 900 is, so the seed is what asks for a map.
+    try std.testing.expectEqual(@as(usize, 1), core.outbox.items.len);
+    try std.testing.expectEqual(resolver.Request.service_map, core.outbox.items[0]);
+
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "BFE" },
+        .{ .pid = 900, .name = "MpsSvc" },
+    }) }, 100);
+    const query = onlyOwnerRequest(&core).?;
+    core.applyCompletion(.{ .owner_module = .{
+        .key = query.key,
+        .generation = query.generation,
+        .module = try gpa.dupe(u8, "MpsSvc"),
+    } }, 200);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try std.testing.expectEqualStrings(
+        "MpsSvc",
+        rowForPid(snap.rows, 900).?.flows[0].service.?,
+    );
+}
+
+test "the service map is re-enumerated on demand, never in a busy loop" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 700, 100, 0, "\\x\\a.exe"), 0);
+
+    // First Flow on an instance no map describes: ask straight away.
+    try core.applyEvent(testEvent(.connect, .tcp, 700, 0, 51000), 0);
+    try std.testing.expectEqual(@as(usize, 1), core.outbox.items.len);
+
+    // More Flows while that request is in flight add nothing.
+    try core.applyEvent(testEvent(.connect, .tcp, 700, 0, 51001), 10);
+    try core.applyEvent(testEvent(.connect, .tcp, 700, 0, 51002), 20);
+    try std.testing.expectEqual(@as(usize, 1), core.outbox.items.len);
+
+    // The query fails; a retry still waits out the floor.
+    core.applyCompletion(.{ .service_map = null }, 30);
+    core.outbox.clearRetainingCapacity();
+    try core.applyEvent(testEvent(.connect, .tcp, 700, 0, 51003), 40);
+    try std.testing.expectEqual(@as(usize, 0), core.outbox.items.len);
+    try core.applyEvent(testEvent(.connect, .tcp, 700, 0, 51004), 2_000);
+    try std.testing.expectEqual(@as(usize, 1), core.outbox.items.len);
+}
+
+test "a shared host's stale service list is refreshed once it ages out" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+        .{ .pid = 900, .name = "RpcSs" },
+        .{ .pid = 900, .name = "RpcEptMapper" },
+    }) }, 1_000);
+    core.outbox.clearRetainingCapacity();
+
+    // A service stopping inside a host that keeps running is invisible to us,
+    // so a fresh Flow on a list this young asks for no re-enumeration...
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 5_000);
+    try std.testing.expectEqual(@as(usize, 1), core.outbox.items.len); // the owner lookup only
+    core.outbox.clearRetainingCapacity();
+
+    // ...but once the list is older than its staleness bound, it does.
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51001), 31_000);
+    var asked_for_map = false;
+    for (core.outbox.items) |req| if (req == .service_map) {
+        asked_for_map = true;
+    };
+    try std.testing.expect(asked_for_map);
+}
+
+/// A resolver backend that never answers, for the stall test below.
+const StalledLookups = struct {
+    entered: sync.WakeEvent,
+    stalling: std.atomic.Value(bool) = .init(true),
+
+    fn lookups(self: *StalledLookups) resolver.Lookups {
+        return .{ .ctx = self, .queryServiceMap = queryServiceMap, .resolveOwners = resolveOwners };
+    }
+
+    fn hold(self: *StalledLookups) void {
+        self.entered.set();
+        while (self.stalling.load(.acquire)) std.Thread.yield() catch {};
+    }
+
+    fn queryServiceMap(ctx: ?*anyopaque, _: std.mem.Allocator) ?*service_map.Raw {
+        const self: *StalledLookups = @ptrCast(@alignCast(ctx.?));
+        self.hold();
+        return null;
+    }
+
+    fn resolveOwners(
+        ctx: ?*anyopaque,
+        _: std.mem.Allocator,
+        _: []const resolver.OwnerQuery,
+        _: []?[]u8,
+    ) void {
+        const self: *StalledLookups = @ptrCast(@alignCast(ctx.?));
+        self.hold();
+    }
+};
+
+test "a resolver call that never returns delays no event and no Snapshot" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    var stalled: StalledLookups = .{ .entered = try .init() };
+    defer stalled.entered.deinit();
+
+    const lane = try gpa.create(resolver.Lane);
+    defer gpa.destroy(lane);
+    try lane.init(gpa, stalled.lookups());
+    defer lane.deinit();
+    const thread = try std.Thread.spawn(.{}, resolver.Lane.run, .{lane});
+
+    // Get the lane genuinely wedged inside a lookup first.
+    try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 0);
+    core.submitOutbox(lane);
+    try std.testing.expectEqual(
+        sync.WakeEvent.WaitResult.signaled,
+        stalled.entered.timedWait(5_000),
+    );
+
+    // Now run the Engine's whole per-pass sequence, many times over, exactly
+    // as runner.zig does — while the lane is stuck.
+    var last_seq: u64 = 0;
+    for (1..201) |i| {
+        const now: u64 = @intCast(i * 10);
+        core.drainCompletions(lane, now);
+        try core.applyEvent(testEventAt(.send, .tcp, 900, 100, 51000, 0), now);
+        try core.applyEvent(testEventAt(.recv, .udp, 700, 7, 5353, 0), now);
+        try core.tick(now);
+        core.submitOutbox(lane);
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try std.testing.expect(snap.seq > last_seq);
+        last_seq = snap.seq;
+    }
+
+    // Every byte landed and every Snapshot was published; the Flows simply
+    // never got a service label.
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 900).?;
+    try std.testing.expectEqual(@as(u64, 200 * 100), row.sent);
+    try std.testing.expectEqual(@as(?[]const u8, null), row.flows[0].service);
+
+    stalled.stalling.store(false, .release);
+    lane.shutdown();
+    thread.join();
+}
+
+test "a Snapshot's service labels outlive the Engine that built it" {
+    const gpa = std.testing.allocator;
+    // Deliberately outlives `core`: a Snapshot is self-contained, so every
+    // name it shows must be its own copy, not a borrow of Engine state.
+    var snap: *snapshot.Snapshot = undefined;
+    {
+        var core = Core.init(gpa);
+        defer core.deinit();
+        try core.applyProcess(procEvent(.rundown, 900, 100, 0, "\\x\\svchost.exe"), 0);
+        core.applyCompletion(.{ .service_map = try service_map.fromPairs(gpa, 200, &.{
+            .{ .pid = 900, .name = "RpcSs" },
+            .{ .pid = 900, .name = "RpcEptMapper" },
+        }) }, 0);
+        try core.applyEvent(testEvent(.connect, .tcp, 900, 0, 51000), 1000);
+        const query = onlyOwnerRequest(&core).?;
+        core.applyCompletion(.{ .owner_module = .{
+            .key = query.key,
+            .generation = query.generation,
+            .module = try gpa.dupe(u8, "RpcSs"),
+        } }, 1100);
+        snap = try core.buildSnapshot(0);
+    }
+    defer snap.release();
+
+    // The interner and every row's service list are gone now.
+    const row = rowForPid(snap.rows, 900).?;
+    try std.testing.expectEqualStrings("RpcSs", row.flows[0].service.?);
+    try std.testing.expectEqualStrings("RpcEptMapper", row.services[0]);
+    try std.testing.expectEqualStrings("RpcSs", row.services[1]);
+}
+
+// ---------------------------------------------------------------------------
 // Hostname Attribution (issue #26) — driven through the same seam: parsed
 // records in, published Snapshots out.
 // ---------------------------------------------------------------------------
@@ -1857,6 +2611,47 @@ test "the exited-row cap rolls the least informative rows into the Evicted-proce
     try std.testing.expect(!live.exited);
     try std.testing.expectEqual(@as(u64, 4242), live.sent);
     try std.testing.expectEqual(@as(u32, 1), live.tcp_conns);
+}
+
+test "service hosts the exited-row cap takes release their service lists" {
+    const gpa = std.testing.allocator;
+    var core = Core.init(gpa);
+    defer core.deinit();
+    // 600 service hosts against the 512-row cap. They must be *alive* when
+    // the map lands — an exited row's list is frozen, never backfilled — and
+    // exit afterwards, so the cap finds 600 exited rows each owning a list.
+    // The 88 it takes must release those lists: the interned names live on,
+    // the per-row slices do not. std.testing.allocator fails this test if any
+    // of them leaks.
+    var total: u64 = 0;
+    var pairs: [600]service_map.Pair = undefined;
+    for (&pairs, 0..) |*p, i| {
+        const pid: u32 = @intCast(1000 + i);
+        const size: u32 = @intCast(100 + i);
+        try core.applyProcess(procEvent(.start, pid, pid, 0, "\\x\\svchost.exe"), 0);
+        try core.applyEvent(testEvent(.send, .tcp, pid, size, @intCast(5000 + i)), 0);
+        total += size;
+        p.* = .{ .pid = pid, .name = "Dnscache" };
+    }
+    // Captured after every one of them started, so the map describes them all.
+    core.applyCompletion(
+        .{ .service_map = try service_map.fromPairs(gpa, 10_000, &pairs) },
+        0,
+    );
+    for (0..600) |i| {
+        const pid: u32 = @intCast(1000 + i);
+        try core.applyProcess(procEvent(.stop, pid, pid, 0, ""), 0);
+    }
+    const short_lived = total;
+    try core.tick(1);
+
+    const snap = try core.buildSnapshot(1);
+    defer snap.release();
+    try std.testing.expectEqual(@as(u64, short_lived), totalBytes(snap.rows));
+    // The survivors kept theirs, frozen at exit.
+    const survivor = rowForPid(snap.rows, 1000 + 88).?;
+    try std.testing.expectEqual(@as(usize, 1), survivor.services.len);
+    try std.testing.expectEqualStrings("Dnscache", survivor.services[0]);
 }
 
 test "a second eviction round reuses the same Evicted-processes Row" {
