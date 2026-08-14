@@ -16,6 +16,9 @@ const tables = @import("tables.zig");
 
 /// Spec: flush every 100–150 ms while flows are active.
 pub const flush_interval_ms: u64 = 120;
+/// Spec issue #18 Data model: the reconciliation sweep against the IP
+/// Helper tables — the safety net for lost TCP close events.
+pub const sweep_interval_ms: u64 = 10_000;
 /// EventsLost is polled at ~1 s — losses are rare and the query costs a
 /// control-path call.
 const loss_check_every_ticks: u32 = 8;
@@ -88,7 +91,7 @@ pub const Engine = struct {
         // the session's buffers behind the just-opened handle.
         const rows = try tables.snapshotConnections(gpa);
         defer gpa.free(rows);
-        try self.core.seed(rows);
+        try self.core.reconcile(rows, 0);
 
         self.consumer_thread = std.Thread.spawn(.{}, consumer_mod.Consumer.run, .{cons}) catch
             return error.SpawnFailed;
@@ -135,11 +138,13 @@ pub const Engine = struct {
         const t0 = win32.GetTickCount64();
         var last_flush: u64 = 0;
         var last_publish: u64 = 0;
+        var last_sweep: u64 = 0;
         var ticks: u32 = 0;
 
         while (!self.stop_requested.load(.acquire)) {
+            const drain_now = win32.GetTickCount64() - t0;
             while (self.ring.pop()) |ev| {
-                self.core.applyEvent(ev) catch {
+                self.core.applyEvent(ev, drain_now) catch {
                     self.oom_drops += 1;
                 };
             }
@@ -153,7 +158,15 @@ pub const Engine = struct {
                     if (self.session.queryEventsLost()) |lost| self.events_lost = lost;
                 }
                 if (self.core.noteLoss(self.ring.droppedTotal() + self.oom_drops, self.events_lost))
-                    self.rebaseline();
+                    self.rebaseline(now);
+                // Flow lifecycle rides the flush tick: Linger expiry and UDP
+                // age-out. OOM leaves the table unchanged; the next tick
+                // retries.
+                self.core.tick(now) catch {};
+                if (now - last_sweep >= sweep_interval_ms) {
+                    last_sweep = now;
+                    self.sweep(now);
+                }
             }
 
             if (self.core.dirty and now - last_publish >= min_publish_interval_ms) {
@@ -175,15 +188,24 @@ pub const Engine = struct {
         }
     }
 
-    /// Unified loss recovery (ADR-0002): re-baseline the connection list
-    /// from fresh tables; if even the tables fail, the flag alone still
-    /// marks the totals.
-    fn rebaseline(self: *Engine) void {
+    /// The 10 s reconciliation sweep: close Flows whose close events were
+    /// lost, keep seeded sockets honest. A failed round is skipped — the
+    /// next sweep retries.
+    fn sweep(self: *Engine, now_ms: u64) void {
+        const rows = tables.snapshotConnections(self.gpa) catch return;
+        defer self.gpa.free(rows);
+        self.core.reconcile(rows, now_ms) catch {};
+    }
+
+    /// Unified loss recovery (ADR-0002): re-baseline the Flow list from
+    /// fresh tables; if even the tables fail, the flag alone still marks
+    /// the totals.
+    fn rebaseline(self: *Engine, now_ms: u64) void {
         const rows = tables.snapshotConnections(self.gpa) catch {
             self.core.flagRebaselined();
             return;
         };
         defer self.gpa.free(rows);
-        self.core.rebaseline(rows) catch self.core.flagRebaselined();
+        self.core.rebaseline(rows, now_ms) catch self.core.flagRebaselined();
     }
 };

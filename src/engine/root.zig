@@ -8,6 +8,7 @@ pub const consumer = @import("consumer.zig");
 pub const core = @import("core.zig");
 pub const etw_session = @import("etw_session.zig");
 pub const event = @import("event.zig");
+pub const flows = @import("flows.zig");
 pub const parser = @import("parser.zig");
 pub const runner = @import("runner.zig");
 pub const snapshot = @import("snapshot.zig");

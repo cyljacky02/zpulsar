@@ -105,6 +105,9 @@ pub const GetExtendedUdpTable = zigwin32.iphlpapi.GetExtendedUdpTable;
 pub const TCP_TABLE_CLASS = ip_helper.TCP_TABLE_CLASS;
 pub const UDP_TABLE_CLASS = ip_helper.UDP_TABLE_CLASS;
 
+/// tcpmib.h connection states; the OWNER_PID rows carry them as raw u32
+/// (`dwState`).
+pub const MIB_TCP_STATE = ip_helper.MIB_TCP_STATE;
 pub const MIB_TCPROW_OWNER_PID = ip_helper.MIB_TCPROW_OWNER_PID;
 pub const MIB_TCPTABLE_OWNER_PID = ip_helper.MIB_TCPTABLE_OWNER_PID;
 pub const MIB_TCP6ROW_OWNER_PID = ip_helper.MIB_TCP6ROW_OWNER_PID;

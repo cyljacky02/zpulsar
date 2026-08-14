@@ -1,7 +1,9 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
-//! issue #20's tracer. Brings the `zPulsarNet` session up, runs the consumer
-//! and Engine threads, and renders a live per-PID In-session Totals table
-//! from acquired Snapshots, health flags included. Requires elevation.
+//! issue #20's tracer, grown Flows (issue #22). Brings the `zPulsarNet`
+//! session up, runs the consumer and Engine threads, and renders a live
+//! per-PID In-session Totals table from acquired Snapshots — each row's
+//! Flows beneath it, Lingering ones dimmed — health flags included.
+//! Requires elevation.
 //!
 //! Usage: zpulsar-headless [--duration <seconds>]
 //! Default runs until Ctrl+C.
@@ -154,17 +156,68 @@ fn writeTable(
             fmtBytes(r.sent, &sent_buf),
             fmtBytes(r.recv, &recv_buf),
         });
+        const flows_shown = @min(r.flows.len, max_flows_per_row);
+        for (r.flows[0..flows_shown]) |f| try writeFlow(w, f, vt);
+        if (r.flows.len > flows_shown)
+            try w.print("           … {d} more flows\n", .{r.flows.len - flows_shown});
     }
     if (snap.rows.len > shown)
         try w.print("  … {d} more processes\n", .{snap.rows.len - shown});
-    try w.print("\n{d} processes   total sent {s}   recv {s}\n", .{
+    try w.print("\n{d} processes   {d} flows   total sent {s}   recv {s}\n", .{
         snap.rows.len,
+        snap.flows.len,
         fmtBytes(total_sent, &sent_buf),
         fmtBytes(total_recv, &recv_buf),
     });
 }
 
 const max_rows = 25;
+const max_flows_per_row = 3;
+
+/// One Flow line beneath its row; Lingering flows render dimmed (VT) and
+/// tagged, matching the spec's dimmed Linger display.
+fn writeFlow(w: *std.Io.Writer, f: engine.snapshot.Flow, vt: bool) !void {
+    var lbuf: [64]u8 = undefined;
+    var rbuf: [64]u8 = undefined;
+    var sbuf: [16]u8 = undefined;
+    var rvbuf: [16]u8 = undefined;
+    const dim = vt and f.lingering;
+    if (dim) try w.writeAll("\x1b[2m");
+    try w.print("           {s} gen{d}  {s} -> {s}  {s} / {s}{s}\n", .{
+        @tagName(f.proto),
+        f.generation,
+        fmtEndpoint(f.family, f.local_addr, f.local_port, &lbuf),
+        fmtEndpoint(f.family, f.remote_addr, f.remote_port, &rbuf),
+        fmtBytes(f.sent, &sbuf),
+        fmtBytes(f.recv, &rvbuf),
+        if (f.lingering) "  [linger]" else "",
+    });
+    if (dim) try w.writeAll("\x1b[22m");
+}
+
+/// "*" for the zero remote of a placeholder (bound socket, no observed
+/// conversation); v6 prints full-form groups — it's a debug rig.
+fn fmtEndpoint(family: engine.event.Family, addr: [16]u8, port: u16, buf: []u8) []const u8 {
+    if (port == 0 and std.mem.allEqual(u8, &addr, 0)) return "*";
+    switch (family) {
+        .v4 => return std.fmt.bufPrint(
+            buf,
+            "{d}.{d}.{d}.{d}:{d}",
+            .{ addr[0], addr[1], addr[2], addr[3], port },
+        ) catch "?",
+        .v6 => {
+            var w: std.Io.Writer = .fixed(buf);
+            w.writeByte('[') catch return "?";
+            var i: usize = 0;
+            while (i < 16) : (i += 2) {
+                if (i > 0) w.writeByte(':') catch return "?";
+                w.print("{x}", .{std.mem.readInt(u16, addr[i..][0..2], .big)}) catch return "?";
+            }
+            w.print("]:{d}", .{port}) catch return "?";
+            return w.buffered();
+        },
+    }
+}
 
 fn rowBusierThan(_: void, a: engine.snapshot.Row, b: engine.snapshot.Row) bool {
     return a.sent + a.recv > b.sent + b.recv;

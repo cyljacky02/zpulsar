@@ -6,15 +6,43 @@
 //! arenas.
 
 const std = @import("std");
+const event = @import("event.zig");
 const sync = @import("sync.zig");
+
+/// One Flow as published: identity, Generation, totals, and whether it is
+/// riding out its Linger window (dimmed in the UI). Hostname and service
+/// attribution are later tickets — the fields are part of the v1 shape but
+/// stay unpopulated here.
+pub const Flow = struct {
+    proto: event.Proto,
+    family: event.Family,
+    /// Raw network-order bytes; v4 occupies the first 4 bytes, rest zero.
+    local_addr: [16]u8,
+    remote_addr: [16]u8,
+    /// Host byte order.
+    local_port: u16,
+    remote_port: u16,
+    /// Distinguishes successive Flows reusing the same endpoints
+    /// (CONTEXT.md "Generation"); starts at 1 per key.
+    generation: u32,
+    sent: u64 = 0,
+    recv: u64 = 0,
+    /// Closed but still visible, dimmed (CONTEXT.md "Linger").
+    lingering: bool = false,
+    remote_hostname: ?[]const u8 = null,
+    service: ?[]const u8 = null,
+};
 
 /// One monitored PID's In-session Totals plus its current connection counts.
 pub const Row = struct {
     pid: u32,
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Live (non-Lingering) flow counts by protocol.
     tcp_conns: u32 = 0,
     udp_socks: u32 = 0,
+    /// This row's Flows, live and Lingering — a slice of Snapshot.flows.
+    flows: []const Flow = &.{},
 };
 
 pub const Health = struct {
@@ -37,6 +65,8 @@ pub const Snapshot = struct {
     health: Health,
     /// Sorted by pid ascending.
     rows: []const Row,
+    /// All flows, sorted by owning pid — each Row's `flows` is a sub-slice.
+    flows: []const Flow,
 
     pub fn retain(self: *Snapshot) void {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -87,12 +117,17 @@ pub const Published = struct {
     }
 };
 
-/// Testing/Core helper: an empty Snapshot shell in its own arena. `rows`
-/// must be filled from the same arena before publish.
-pub fn create(gpa: std.mem.Allocator, row_count: usize) error{OutOfMemory}!*Snapshot {
+/// Testing/Core helper: an empty Snapshot shell in its own arena. `rows` and
+/// `flows` must be filled from the same arena before publish.
+pub fn create(
+    gpa: std.mem.Allocator,
+    row_count: usize,
+    flow_count: usize,
+) error{OutOfMemory}!*Snapshot {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
     const rows = try arena.allocator().alloc(Row, row_count);
+    const flow_slice = try arena.allocator().alloc(Flow, flow_count);
     const snap = try arena.allocator().create(Snapshot);
     snap.* = .{
         .refs = .init(1),
@@ -102,6 +137,7 @@ pub fn create(gpa: std.mem.Allocator, row_count: usize) error{OutOfMemory}!*Snap
         .seq = 0,
         .health = .{},
         .rows = rows,
+        .flows = flow_slice,
     };
     return snap;
 }
@@ -111,9 +147,14 @@ pub fn mutableRows(snap: *Snapshot) []Row {
     return @constCast(snap.rows);
 }
 
+/// Same publish-window mutability for the flat flow array.
+pub fn mutableFlows(snap: *Snapshot) []Flow {
+    return @constCast(snap.flows);
+}
+
 test "release frees the whole arena exactly once" {
     // std.testing.allocator fails the test on leak or double-free.
-    const snap = try create(std.testing.allocator, 100);
+    const snap = try create(std.testing.allocator, 100, 0);
     snap.retain();
     snap.release();
     snap.release();
@@ -124,7 +165,7 @@ test "publish transfers ownership and releases the replaced snapshot" {
     defer published.deinit();
     try std.testing.expectEqual(@as(?*Snapshot, null), published.acquire());
 
-    const a = try create(std.testing.allocator, 1);
+    const a = try create(std.testing.allocator, 1, 0);
     mutableRows(a)[0] = .{ .pid = 11 };
     published.publish(a);
 
@@ -132,7 +173,7 @@ test "publish transfers ownership and releases the replaced snapshot" {
     try std.testing.expectEqual(@as(u32, 11), held.rows[0].pid);
 
     // Replacing drops the slot's reference to `a`; the held one keeps it alive.
-    const b = try create(std.testing.allocator, 1);
+    const b = try create(std.testing.allocator, 1, 0);
     mutableRows(b)[0] = .{ .pid = 22 };
     published.publish(b);
     try std.testing.expectEqual(@as(u32, 11), held.rows[0].pid);
@@ -144,6 +185,6 @@ test "publish sets the reader wake event" {
     var published: Published = try .init();
     defer published.deinit();
     try std.testing.expectEqual(sync.WakeEvent.WaitResult.timeout, published.wake.timedWait(0));
-    published.publish(try create(std.testing.allocator, 0));
+    published.publish(try create(std.testing.allocator, 0, 0));
     try std.testing.expectEqual(sync.WakeEvent.WaitResult.signaled, published.wake.timedWait(0));
 }
