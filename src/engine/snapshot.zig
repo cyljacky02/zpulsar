@@ -7,12 +7,13 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const hostnames = @import("hostnames.zig");
 const sync = @import("sync.zig");
 
-/// One Flow as published: identity, Generation, totals, and whether it is
-/// riding out its Linger window (dimmed in the UI). Hostname and service
-/// attribution are later tickets — the fields are part of the v1 shape but
-/// stay unpopulated here.
+/// One Flow as published: identity, Generation, totals, whether it is riding
+/// out its Linger window (dimmed in the UI), and its remote name. Service
+/// attribution is a later ticket — the field is part of the v1 shape but
+/// stays unpopulated here.
 pub const Flow = struct {
     proto: event.Proto,
     family: event.Family,
@@ -34,7 +35,16 @@ pub const Flow = struct {
     recv_rate: u64 = 0,
     /// Closed but still visible, dimmed (CONTEXT.md "Linger").
     lingering: bool = false,
+    /// The name resolved once at Flow creation and stored (CONTEXT.md
+    /// "Hostname Attribution"); null shows the bare endpoint. Arena-owned by
+    /// this Snapshot.
     remote_hostname: ?[]const u8 = null,
+    /// The CNAME chain's tail behind `remote_hostname`, when the answer had
+    /// one — the name the address actually belongs to.
+    remote_alias: ?[]const u8 = null,
+    /// Which tier produced `remote_hostname`. Only `observed` is the name the
+    /// process actually resolved; hints render dimmed with their own marker.
+    hostname_origin: hostnames.Origin = .observed,
     service: ?[]const u8 = null,
 };
 

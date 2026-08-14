@@ -1,10 +1,12 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
 //! issue #20's tracer plus issue #21's Process Rows, issue #22's Flows, and
-//! issue #23's rates. Brings the `zPulsarNet` session up, runs the consumer
-//! and Engine threads, and renders a live per-process table from acquired
-//! Snapshots — real image names, live down/up speeds, In-session Totals,
-//! dimmed "(exited)" rows, each row's Flows beneath it with Lingering ones
-//! dimmed, health flags. Requires elevation.
+//! issue #23's rates, and issue #26's Hostname Attribution. Brings the
+//! `zPulsarNet` session up, runs the consumer, Engine, and reverse-lookup
+//! threads, and renders a live per-process table from acquired Snapshots —
+//! real image names, live down/up speeds, In-session Totals, dimmed
+//! "(exited)" rows, each row's Flows beneath it with Lingering ones dimmed
+//! and remote names marked by the tier that produced them, health flags.
+//! Requires elevation.
 //!
 //! Usage: zpulsar-headless [--duration <seconds>]
 //! Default runs until Ctrl+C.
@@ -194,9 +196,11 @@ fn writeTable(
 }
 
 const max_rows = 25;
-/// Names longer than this are left-truncated — the tail (the exe name) is
-/// the interesting part, and wrapping lines would break the in-place repaint.
+/// Names longer than this are left-truncated — the tail (the exe name, the
+/// registrable domain) is the interesting part, and wrapping lines would break
+/// the in-place repaint.
 const max_name_display = 56;
+const max_hostname_display = 48;
 const max_flows_per_row = 3;
 
 /// One Flow line beneath its row; Lingering flows render dimmed (VT) and
@@ -208,9 +212,9 @@ fn writeFlow(w: *std.Io.Writer, f: engine.snapshot.Flow, vt: bool) !void {
     var rvbuf: [16]u8 = undefined;
     var dbuf: [20]u8 = undefined;
     var ubuf: [20]u8 = undefined;
-    const dim = vt and f.lingering;
-    if (dim) try w.writeAll("\x1b[2m");
-    try w.print("           {s} gen{d}  {s} -> {s}  ↓ {s} ↑ {s}  {s} / {s}{s}\n", .{
+    const line_dim = vt and f.lingering;
+    if (line_dim) try w.writeAll("\x1b[2m");
+    try w.print("           {s} gen{d}  {s} -> {s}  ↓ {s} ↑ {s}  {s} / {s}", .{
         @tagName(f.proto),
         f.generation,
         fmtEndpoint(f.family, f.local_addr, f.local_port, &lbuf),
@@ -219,8 +223,30 @@ fn writeFlow(w: *std.Io.Writer, f: engine.snapshot.Flow, vt: bool) !void {
         fmtRate(f.sent_rate, &ubuf),
         fmtBytes(f.sent, &sbuf),
         fmtBytes(f.recv, &rvbuf),
-        if (f.lingering) "  [linger]" else "",
     });
+    try writeHostname(w, f, vt and !line_dim);
+    if (f.lingering) try w.writeAll("  [linger]");
+    if (line_dim) try w.writeAll("\x1b[22m");
+    try w.writeAll("\n");
+}
+
+/// The remote name, marked by the tier that produced it (spec issue #18 UI;
+/// docs/research/dns-client-etw.md §7): an observed name — the one the
+/// process actually resolved — renders plain, while cache-snapshot and
+/// reverse-lookup names are hints and render dimmed behind a badge. No name
+/// means the bare endpoint above already says everything known.
+fn writeHostname(w: *std.Io.Writer, f: engine.snapshot.Flow, dim_hints: bool) !void {
+    const name = f.remote_hostname orelse return;
+    const badge = switch (f.hostname_origin) {
+        .observed => "",
+        .cache => "[cache] ",
+        .reverse => "[rDNS] ",
+    };
+    const dim = dim_hints and f.hostname_origin != .observed;
+    if (dim) try w.writeAll("\x1b[2m");
+    try w.print("  {s}{s}", .{ badge, truncateTail(name, max_hostname_display) });
+    if (f.remote_alias) |alias|
+        try w.print(" (via {s})", .{truncateTail(alias, max_hostname_display)});
     if (dim) try w.writeAll("\x1b[22m");
 }
 
@@ -261,11 +287,15 @@ fn rowBusierThan(_: void, a: engine.snapshot.Row, b: engine.snapshot.Row) bool {
 /// process has no identity yet (traffic racing the rundown, or event loss).
 fn displayName(name: []const u8) []const u8 {
     if (name.len == 0) return "?";
-    if (name.len <= max_name_display) return name;
-    var start = name.len - max_name_display;
-    // Never cut a multi-byte UTF-8 sequence in half.
-    while (start < name.len and name[start] & 0xC0 == 0x80) start += 1;
-    return name[start..];
+    return truncateTail(name, max_name_display);
+}
+
+/// Keep the tail, never cutting a multi-byte UTF-8 sequence in half.
+fn truncateTail(text: []const u8, limit: usize) []const u8 {
+    if (text.len <= limit) return text;
+    var start = text.len - limit;
+    while (start < text.len and text[start] & 0xC0 == 0x80) start += 1;
+    return text[start..];
 }
 
 /// Decimal units per the spec's display rules (B/KB/MB/GB).

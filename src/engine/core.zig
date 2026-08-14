@@ -21,7 +21,9 @@ const std = @import("std");
 const device_map = @import("device_map.zig");
 const event = @import("event.zig");
 const flows = @import("flows.zig");
+const hostnames = @import("hostnames.zig");
 const rates = @import("rates.zig");
+const reverse_lookup = @import("reverse_lookup.zig");
 const snapshot = @import("snapshot.zig");
 const tables = @import("tables.zig");
 
@@ -31,6 +33,10 @@ const tables = @import("tables.zig");
 pub const exited_row_cap: usize = 512;
 /// The label the Evicted-processes Row carries (CONTEXT.md).
 pub const evicted_processes_name = "(evicted processes)";
+/// How often the Flow list is walked for name maintenance: cache refreshes
+/// and reverse-lookup candidates. Well under the 2 s grace, and far cheaper
+/// than doing either on the per-event path.
+const name_maintenance_ms: u64 = 500;
 
 /// One process instance. `create_time == 0` marks a placeholder: traffic or
 /// a table row arrived before the identity did (cold-start race); the first
@@ -72,6 +78,12 @@ pub const Core = struct {
     /// traffic goes.
     exited_by_pid: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     flows: flows.Table = .{},
+    /// The tiered address→name cache a Flow consults once, at creation.
+    names: hostnames.Table = .{},
+    /// The reverse-lookup lane, when one is running. Null leaves unnamed
+    /// Flows showing their bare endpoints — which is what the Engine does
+    /// anyway until a lookup lands.
+    reverse: ?*reverse_lookup.Lane = null,
     /// NT-device → drive-letter display conversion. Populated by the runner
     /// at start; owned (and freed) by Core.
     drive_map: device_map.DriveMap = .{},
@@ -81,6 +93,9 @@ pub const Core = struct {
     dirty: bool = true,
     /// Scratch flow-entry list reused across snapshot builds.
     flow_scratch: std.ArrayList(flows.Entry) = .empty,
+    /// Scratch reverse-lookup candidate list, reused across maintenance passes.
+    reverse_scratch: std.ArrayList(event.IpAddr) = .empty,
+    last_name_maintenance_ms: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Core {
         return .{ .gpa = gpa };
@@ -92,8 +107,10 @@ pub const Core = struct {
         self.live_by_pid.deinit(self.gpa);
         self.exited_by_pid.deinit(self.gpa);
         self.flows.deinit(self.gpa);
+        self.names.deinit(self.gpa);
         self.drive_map.deinit(self.gpa);
         self.flow_scratch.deinit(self.gpa);
+        self.reverse_scratch.deinit(self.gpa);
     }
 
     /// Apply one net-event ring record. OOM drops the record — the caller
@@ -117,7 +134,13 @@ pub const Core = struct {
                 row.rate.add(at, sent, recv);
                 // First activity opens the Flow (raced the table snapshot,
                 // or a new Generation after closure).
-                const live = try self.flows.touch(self.gpa, flows.flowKey(ev), idx, now_ms);
+                const live = try self.flows.touch(
+                    self.gpa,
+                    flows.flowKey(ev),
+                    idx,
+                    now_ms,
+                    &self.names,
+                );
                 live.sent += sent;
                 live.recv += recv;
                 live.rate.add(at, sent, recv);
@@ -125,7 +148,7 @@ pub const Core = struct {
             },
             .connect => {
                 const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
-                try self.flows.connect(self.gpa, flows.flowKey(ev), idx, now_ms);
+                try self.flows.connect(self.gpa, flows.flowKey(ev), idx, now_ms, &self.names);
                 self.dirty = true;
             },
             .disconnect => {
@@ -240,6 +263,10 @@ pub const Core = struct {
         _ = self.live_by_pid.remove(row.pid);
         try self.exited_by_pid.put(self.gpa, row.pid, idx);
         _ = try self.flows.closeRowFlows(self.gpa, idx, now_ms);
+        // The PID is up for reuse: drop what only this process observed, so
+        // the next holder cannot inherit its names (research §5). Flows
+        // already open keep the name they were attributed at creation.
+        self.names.forgetPid(self.gpa, row.pid);
     }
 
     /// Set a row's display name from a start/rundown payload, first writer
@@ -251,13 +278,89 @@ pub const Core = struct {
         self.rows.items[idx].name = try self.drive_map.displayPath(self.gpa, buf[0..n]);
     }
 
-    /// Time-driven maintenance: Linger expiry, UDP age-outs, and the memory
-    /// caps. Called at the Engine's flush-tick cadence, so the caps are
-    /// enforced within a tick of being crossed rather than per event.
+    /// Apply one accepted DNS-Client 3008 record: the name this process
+    /// resolved, for every address the answer carried (spec issue #18
+    /// "Capture: hostname observation"). Flows already open to those
+    /// addresses upgrade in place.
+    pub fn applyDns(
+        self: *Core,
+        ev: event.DnsEvent,
+        now_ms: u64,
+    ) error{OutOfMemory}!void {
+        // A nameless observation would occupy the global tier without naming
+        // anything — and, worse, suppress the reverse lookup that would have.
+        if (ev.name_len == 0) return;
+        const name: hostnames.Name = .{
+            .text = ev.name(),
+            .alias = ev.alias(),
+            .origin = .observed,
+        };
+        for (ev.addresses()) |ip| {
+            try self.names.observe(self.gpa, ev.pid, ip, name, now_ms);
+            if (try self.flows.applyName(self.gpa, ip, name)) self.dirty = true;
+        }
+    }
+
+    /// Time-driven maintenance: Linger expiry, UDP age-outs, the memory caps,
+    /// and the Hostname Attribution upkeep — reverse-lookup results in,
+    /// candidates out, idle cache entries expired. Called at the Engine's
+    /// flush-tick cadence, so the caps are enforced within a tick of being
+    /// crossed rather than per event.
+    ///
+    /// Naming runs last, after the caps: a Flow the cap just took must not be
+    /// queued for a lookup whose result would have nowhere to land.
     pub fn tick(self: *Core, now_ms: u64) error{OutOfMemory}!void {
         if (try self.flows.tick(self.gpa, now_ms)) self.dirty = true;
         if (try self.flows.evict(self.gpa)) self.dirty = true;
         if (try self.evictRows()) self.dirty = true;
+        if (self.reverse) |lane| {
+            while (lane.popResult()) |result| try self.applyReverse(result, now_ms);
+        }
+        if (now_ms -| self.last_name_maintenance_ms >= name_maintenance_ms) {
+            self.last_name_maintenance_ms = now_ms;
+            try self.maintainNames(now_ms);
+        }
+    }
+
+    /// One finished reverse lookup. A name enters the hint tier and un-bares
+    /// the Flows waiting on it; a proven absence enters the negative cache, so
+    /// the address is left alone for the next ten minutes. A lookup that
+    /// simply did not complete records nothing — that is a fact about the
+    /// resolver, not the address, and the next pass will ask again.
+    fn applyReverse(
+        self: *Core,
+        result: reverse_lookup.Result,
+        now_ms: u64,
+    ) error{OutOfMemory}!void {
+        self.names.clearPending(result.ip);
+        switch (result.answer) {
+            .named => {
+                const name: hostnames.Name = .{ .text = result.name(), .origin = .reverse };
+                try self.names.noteHint(self.gpa, result.ip, name, now_ms);
+                if (try self.flows.applyName(self.gpa, result.ip, name)) self.dirty = true;
+            },
+            .no_record => try self.names.noteMissing(self.gpa, result.ip, now_ms),
+            .failed => {},
+        }
+    }
+
+    fn maintainNames(self: *Core, now_ms: u64) error{OutOfMemory}!void {
+        self.reverse_scratch.clearRetainingCapacity();
+        const collected = self.flows.maintainNames(
+            self.gpa,
+            &self.names,
+            now_ms,
+            &self.reverse_scratch,
+        );
+        // Candidates come out already claimed, so queue-or-release has to run
+        // even when collection ran out of memory partway: an address left
+        // claimed is never asked about and never named again.
+        for (self.reverse_scratch.items) |ip| {
+            const queued = if (self.reverse) |lane| lane.request(ip) else false;
+            if (!queued) self.names.clearPending(ip);
+        }
+        try collected;
+        self.names.sweep(self.gpa, now_ms);
     }
 
     /// Enforce the exited-row cap (CONTEXT.md "Eviction"): the least
@@ -386,7 +489,7 @@ pub const Core = struct {
         rows: []const tables.SeededConn,
         now_ms: u64,
     ) error{OutOfMemory}!void {
-        if (try self.flows.reconcile(self.gpa, rows, self, now_ms)) self.dirty = true;
+        if (try self.flows.reconcile(self.gpa, rows, self, now_ms, &self.names)) self.dirty = true;
     }
 
     /// Compare cumulative loss counters against the last observed values.
@@ -464,7 +567,15 @@ pub const Core = struct {
         }
         // Flows address rows by position — attach spans and count live
         // flows before sorting (the sorted rows carry their slices along).
-        for (self.flow_scratch.items, 0..) |e, i| flat[i] = e.flow;
+        // Names are borrowed from the Flow layer, so they are copied into the
+        // arena here: a published Snapshot is self-contained.
+        for (self.flow_scratch.items, 0..) |e, i| {
+            flat[i] = e.flow;
+            if (e.flow.remote_hostname) |h|
+                flat[i].remote_hostname = try snapshot.arenaDupe(snap, h);
+            if (e.flow.remote_alias) |a|
+                flat[i].remote_alias = try snapshot.arenaDupe(snap, a);
+        }
         var fi: usize = 0;
         while (fi < self.flow_scratch.items.len) {
             const start = fi;
@@ -1159,6 +1270,344 @@ test "process exit closes its live Flows into normal Linger" {
     try std.testing.expectEqual(@as(u64, 55), row2.sent);
 }
 
+// ---------------------------------------------------------------------------
+// Hostname Attribution (issue #26) — driven through the same seam: parsed
+// records in, published Snapshots out.
+// ---------------------------------------------------------------------------
+
+/// The address `testEvent` connects to.
+const test_remote: event.IpAddr = .{
+    .family = .v4,
+    .addr = [4]u8{ 93, 184, 216, 34 } ++ @as([12]u8, @splat(0)),
+};
+const other_remote: event.IpAddr = .{
+    .family = .v4,
+    .addr = [4]u8{ 8, 8, 4, 4 } ++ @as([12]u8, @splat(0)),
+};
+
+fn dnsEvent(
+    pid: u32,
+    comptime name: []const u8,
+    addrs: []const event.IpAddr,
+) event.DnsEvent {
+    var ev: event.DnsEvent = .{
+        .pid = pid,
+        .name_len = name.len,
+        .alias_len = 0,
+        .addr_count = @intCast(addrs.len),
+        .name_buf = undefined,
+        .alias_buf = undefined,
+        .addrs = undefined,
+    };
+    @memcpy(ev.name_buf[0..name.len], name);
+    @memcpy(ev.addrs[0..addrs.len], addrs);
+    return ev;
+}
+
+/// A flow event whose remote endpoint is `other_remote` rather than the
+/// default one.
+fn testEventTo(op: event.Op, pid: u32, local_port: u16, remote: event.IpAddr) event.NetEvent {
+    var ev = testEvent(op, .tcp, pid, 0, local_port);
+    ev.remote_addr = remote.addr;
+    return ev;
+}
+
+var test_reverse_name: []const u8 = "";
+var test_reverse_calls: u32 = 0;
+
+/// An empty name stands for "this address has no PTR record".
+fn testReverseLookup(
+    ip: event.IpAddr,
+    out: *[event.max_hostname_bytes]u8,
+) reverse_lookup.Answer {
+    _ = ip;
+    test_reverse_calls += 1;
+    if (test_reverse_name.len == 0) return .no_record;
+    @memcpy(out[0..test_reverse_name.len], test_reverse_name);
+    return .{ .named = @intCast(test_reverse_name.len) };
+}
+
+/// A lane with its blocking call faked out and its thread never started —
+/// tests drive it by hand through `serviceOnce`.
+fn attachTestLane(core: *Core, name: []const u8) !*reverse_lookup.Lane {
+    const lane = try std.testing.allocator.create(reverse_lookup.Lane);
+    lane.* = try reverse_lookup.Lane.init();
+    lane.lookup = &testReverseLookup;
+    core.reverse = lane;
+    test_reverse_name = name;
+    test_reverse_calls = 0;
+    return lane;
+}
+
+fn detachTestLane(lane: *reverse_lookup.Lane) void {
+    lane.deinit();
+    std.testing.allocator.destroy(lane);
+}
+
+fn firstFlow(snap: *snapshot.Snapshot, pid: u32) snapshot.Flow {
+    return rowForPid(snap.rows, pid).?.flows[0];
+}
+
+fn expectHostname(
+    expected: []const u8,
+    expected_origin: hostnames.Origin,
+    flow: snapshot.Flow,
+) !void {
+    const name = flow.remote_hostname orelse return error.ExpectedHostname;
+    try std.testing.expectEqualStrings(expected, name);
+    try std.testing.expectEqual(expected_origin, flow.hostname_origin);
+}
+
+test "a Flow opened after a resolution shows the name the process resolved" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    // 3008 fires for cache hits exactly as it does for wire queries
+    // (research §3), so at this seam a cache-hit resolution is this record.
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 100);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("example.com", .observed, firstFlow(snap, 100));
+}
+
+test "the CNAME tail rides along to the Flow for optional display" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    var ev = dnsEvent(100, "www.microsoft.test", &.{test_remote});
+    const alias = "e13678.dscb.akamaiedge.test";
+    @memcpy(ev.alias_buf[0..alias.len], alias);
+    ev.alias_len = alias.len;
+    try core.applyDns(ev, 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 100);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const flow = firstFlow(snap, 100);
+    try std.testing.expectEqualStrings("www.microsoft.test", flow.remote_hostname.?);
+    try std.testing.expectEqualStrings(alias, flow.remote_alias.?);
+}
+
+test "a late observation upgrades and un-dims the Flow in place; the first observed name is permanent" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const lane = try attachTestLane(&core, "ec2-93-184-216-34.compute-1.test");
+    defer detachTestLane(lane);
+
+    // Nothing resolved this address yet: the Flow opens showing bare endpoint.
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 0);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            firstFlow(snap, 100).remote_hostname,
+        );
+    }
+
+    // The reverse-lookup hint lands — a name, but a dimmed one.
+    try core.tick(3_000);
+    lane.serviceOnce();
+    try core.tick(3_500);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try expectHostname("ec2-93-184-216-34.compute-1.test", .reverse, firstFlow(snap, 100));
+    }
+
+    // The real resolution arrives late and upgrades the live Flow in place.
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 4_000);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try expectHostname("example.com", .observed, firstFlow(snap, 100));
+    }
+
+    // Re-resolution under a different name (CDN churn) must not rewrite a
+    // Flow that already carries an observed name: the first one is permanent.
+    try core.applyDns(dnsEvent(100, "cdn.elsewhere.test", &.{test_remote}), 5_000);
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("example.com", .observed, firstFlow(snap, 100));
+}
+
+test "a Lingering Flow is upgraded too — it is still on screen" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    const data = testEvent(.send, .tcp, 100, 10, 51000);
+    try core.applyEvent(data, 0);
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 1_000);
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 2_000);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const flow = firstFlow(snap, 100);
+    try std.testing.expect(flow.lingering);
+    try expectHostname("example.com", .observed, flow);
+}
+
+test "an unresolved Flow gets a dimmed reverse name, but not before the grace" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const lane = try attachTestLane(&core, "ptr.example.test");
+    defer detachTestLane(lane);
+
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 0);
+
+    // Inside the grace nothing is asked — a late 3008 still gets its chance.
+    try core.tick(1_000);
+    lane.serviceOnce();
+    try std.testing.expectEqual(@as(u32, 0), test_reverse_calls);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            firstFlow(snap, 100).remote_hostname,
+        );
+    }
+
+    // Past it the lane is asked exactly once, and the answer shows dimmed.
+    try core.tick(hostnames.reverse_grace_ms);
+    lane.serviceOnce();
+    try std.testing.expectEqual(@as(u32, 1), test_reverse_calls);
+    try core.tick(hostnames.reverse_grace_ms + 500);
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("ptr.example.test", .reverse, firstFlow(snap, 100));
+}
+
+test "a PTR-less address is asked once, then left alone for the negative window" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const lane = try attachTestLane(&core, ""); // no PTR record
+    defer detachTestLane(lane);
+
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 0);
+    try core.tick(2_000);
+    lane.serviceOnce();
+    try core.tick(2_500);
+    try std.testing.expectEqual(@as(u32, 1), test_reverse_calls);
+
+    // Ticking on for minutes must not re-ask: most cloud ranges have no PTR,
+    // and a Flow can outlive the window many times over.
+    var now: u64 = 3_000;
+    while (now < 2_000 + hostnames.negative_ttl_ms) : (now += 30_000) {
+        try core.tick(now);
+        lane.serviceOnce();
+    }
+    try std.testing.expectEqual(@as(u32, 1), test_reverse_calls);
+
+    // The Flow shows its bare endpoint the whole time — nothing is invented.
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            firstFlow(snap, 100).remote_hostname,
+        );
+    }
+
+    // Once the window passes — measured from when the answer landed — the
+    // address is fair game again: networks change.
+    try core.tick(2_500 + hostnames.negative_ttl_ms + 1);
+    lane.serviceOnce();
+    try std.testing.expectEqual(@as(u32, 2), test_reverse_calls);
+}
+
+test "a resolver-bypassing process degrades through the tiers, never to a wrong name" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const lane = try attachTestLane(&core, "ptr.example.test");
+    defer detachTestLane(lane);
+
+    // One process resolves normally through the Windows resolver.
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 0);
+
+    // A resolver-bypassing process (nslookup's own stub, in-app DoH) emits no
+    // 3008 of its own — the global tier still names its Flow, because some
+    // process did observe that address.
+    try core.applyEvent(testEvent(.connect, .tcp, 200, 0, 52000), 100);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try expectHostname("example.com", .observed, firstFlow(snap, 200));
+    }
+
+    // For an address nobody resolved, the gap is covered rather than hidden:
+    // bare endpoint first, then a dimmed hint — never a borrowed name.
+    try core.applyEvent(testEventTo(.connect, 300, 53000, other_remote), 100);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try std.testing.expectEqual(
+            @as(?[]const u8, null),
+            firstFlow(snap, 300).remote_hostname,
+        );
+    }
+    try core.tick(3_000);
+    lane.serviceOnce();
+    try core.tick(3_500);
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("ptr.example.test", .reverse, firstFlow(snap, 300));
+    // The other process's name never leaked onto it.
+    try expectHostname("example.com", .observed, firstFlow(snap, 200));
+}
+
+test "a dual-stack Flow matches the v4 observation behind its mapped address" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    // The resolver reports a dual-family lookup's v4 answers as v4.
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 0);
+
+    // The socket is dual-stack, so Kernel-Network reports the same host as a
+    // v6 event carrying ::ffff:93.184.216.34. Both sides normalize, or the
+    // Flow would silently fall through to a reverse lookup.
+    var ev = testEvent(.connect, .tcp, 100, 0, 51000);
+    ev.family = .v6;
+    ev.remote_addr = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++
+        [4]u8{ 93, 184, 216, 34 };
+    try core.applyEvent(ev, 100);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const flow = firstFlow(snap, 100);
+    try expectHostname("example.com", .observed, flow);
+    // Flow identity is untouched — it really is a v6 conversation.
+    try std.testing.expectEqual(event.Family.v6, flow.family);
+}
+
+test "a Flow keeps the name it opened with when a new Generation resolves differently" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    try core.applyDns(dnsEvent(100, "first.test", &.{test_remote}), 0);
+    const data = testEvent(.send, .tcp, 100, 500, 51000);
+    try core.applyEvent(data, 100);
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 200);
+
+    // The address is re-resolved under a new name, then the endpoints are
+    // reused: the new Generation gets the new name, the old keeps its own.
+    try core.applyDns(dnsEvent(100, "second.test", &.{test_remote}), 300);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 400);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try expectHostname("first.test", .observed, row.flows[0]);
+    try expectHostname("second.test", .observed, row.flows[1]);
+}
+
 test "a known-rate transfer surfaces as bytes per second on its Row and its Flow" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
@@ -1514,6 +1963,80 @@ test "bytes are conserved across arbitrary eviction sequences" {
     defer snap.release();
     try std.testing.expectEqual(fed, totalBytes(snap.rows));
     try std.testing.expectEqual(flows.cap, snap.flows.len);
+}
+
+// ---------------------------------------------------------------------------
+// Where issues #23 and #26 meet: a Flow the memory caps remove is carrying a
+// heap-allocated name. Every eviction path has to release it — the caps are
+// the only places a Flow leaves the table without closing. The testing
+// allocator is the assertion: it fails the test on a leak or a double free.
+// ---------------------------------------------------------------------------
+
+test "Flows the cap evicts release their names; the survivors keep theirs" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    // Every testEvent Flow shares one remote address, so a single resolution
+    // names all of them — and all 17 000 carry an allocation into the cap.
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 0);
+    var i: u16 = 0;
+    while (i < 17_000) : (i += 1)
+        try core.applyEvent(testEvent(.send, .tcp, 100, 100, 1000 + i), i);
+    try core.tick(17_000);
+
+    const snap = try core.buildSnapshot(17_000);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(flows.cap, row.flows.len);
+    // The cap coarsens what is visible, never what is named: what survives
+    // still carries the name it opened with.
+    try expectHostname("example.com", .observed, row.flows[0]);
+    try expectHostname("example.com", .observed, row.flows[row.flows.len - 1]);
+}
+
+test "named Lingering Flows the cap takes release their names" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 0);
+    // Open and immediately close each Flow, all at the same instant, so the
+    // whole Linger queue is still inside its window when the cap arrives —
+    // otherwise normal expiry would drain it below the cap and the eviction
+    // path under test would never run.
+    var i: u16 = 0;
+    while (i < 17_000) : (i += 1) {
+        const data = testEvent(.send, .tcp, 100, 100, 1000 + i);
+        try core.applyEvent(data, 0);
+        var fin = data;
+        fin.op = .disconnect;
+        try core.applyEvent(fin, 0);
+    }
+    try core.tick(1);
+
+    const snap = try core.buildSnapshot(1);
+    defer snap.release();
+    try std.testing.expectEqual(flows.cap, snap.flows.len);
+    for (snap.flows) |f| try std.testing.expect(f.lingering);
+}
+
+test "Flows leaving with an evicted Process Row release their names" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    // 600 short-lived processes against the 512-row cap. Their Flows all
+    // reach the same address, so every one of them is named before its owning
+    // row is evicted out from under it.
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 0);
+    const fed = try runShortLivedProcesses(&core, 1000, 600);
+    try core.tick(1);
+
+    const snap = try core.buildSnapshot(1);
+    defer snap.release();
+    // The Eviction invariant still holds with names in play: attribution
+    // coarsened, not one byte moved anywhere but upward.
+    try std.testing.expectEqual(fed, totalBytes(snap.rows));
+    const survivor = rowForPid(snap.rows, 1000 + 88).?;
+    try expectHostname("example.com", .observed, survivor.flows[0]);
 }
 
 test "a held Snapshot never changes while the Engine keeps updating" {

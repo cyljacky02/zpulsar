@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const win32 = @import("win32");
+const dns_parser = @import("dns_parser.zig");
 const etw_session = @import("etw_session.zig");
 const event = @import("event.zig");
 const parser = @import("parser.zig");
@@ -28,6 +29,14 @@ pub const Ring = spsc_ring.SpscRing(event.NetEvent, ring_capacity);
 pub const process_ring_capacity = 1024;
 pub const ProcessRing = spsc_ring.SpscRing(event.ProcessEvent, process_ring_capacity);
 
+/// Completed resolutions run at ~4 events/s on an idle desktop
+/// (docs/research/dns-client-etw.md §6) and the Engine drains every flush
+/// tick, so this is orders of magnitude of headroom. Overflow would cost
+/// names, never bytes: the affected Flows fall through to the reverse-lookup
+/// lane, which is why DNS drops stay out of the totals loss signal.
+pub const dns_ring_capacity = 128;
+pub const DnsRing = spsc_ring.SpscRing(event.DnsEvent, dns_ring_capacity);
+
 /// The unknown-version seam: production asks TDH per event (process_tdh);
 /// tests inject a fake.
 pub const ProcessFallbackFn = *const fn (
@@ -38,6 +47,7 @@ pub const ProcessFallbackFn = *const fn (
 pub const Consumer = struct {
     ring: *Ring,
     process_ring: *ProcessRing,
+    dns_ring: *DnsRing,
     wake: sync.WakeEvent,
     fallback: tdh.FallbackCache,
     process_fallback: ProcessFallbackFn = process_tdh.parse,
@@ -49,12 +59,14 @@ pub const Consumer = struct {
     pub fn init(
         ring: *Ring,
         process_ring: *ProcessRing,
+        dns_ring: *DnsRing,
         wake: sync.WakeEvent,
         gpa: std.mem.Allocator,
     ) Consumer {
         return .{
             .ring = ring,
             .process_ring = process_ring,
+            .dns_ring = dns_ring,
             .wake = wake,
             .fallback = .init(gpa),
         };
@@ -101,7 +113,7 @@ pub const Consumer = struct {
     }
 
     /// Provider dispatch. The session also delivers ETW's own control events
-    /// (e.g. the EventTrace header); anything but our two providers is
+    /// (e.g. the EventTrace header); anything but our three providers is
     /// ignored.
     fn handleRecord(self: *Consumer, rec: *win32.EVENT_RECORD) void {
         const provider = &rec.EventHeader.ProviderId.Bytes;
@@ -109,6 +121,8 @@ pub const Consumer = struct {
             self.handleNetRecord(rec);
         } else if (std.mem.eql(u8, provider, &etw_session.kernel_process_guid.Bytes)) {
             self.handleProcessRecord(rec);
+        } else if (std.mem.eql(u8, provider, &etw_session.dns_client_guid.Bytes)) {
+            self.handleDnsRecord(rec);
         }
     }
 
@@ -139,6 +153,21 @@ pub const Consumer = struct {
         if (self.process_ring.push(ev) == .pushed_was_empty) self.wake.set();
     }
 
+    /// DNS-Client 3008 → the DNS ring. Unlike the other two providers, the
+    /// attribution PID is the *header* PID: 3008 is emitted in-process by
+    /// dnsapi.dll and has no PID payload field (research §2). The provider's
+    /// other 3000-series events are enabled along with it and drop here.
+    fn handleDnsRecord(self: *Consumer, rec: *win32.EVENT_RECORD) void {
+        const desc = rec.EventHeader.EventDescriptor;
+        const ev = dns_parser.parse(
+            desc.Id,
+            desc.Version,
+            rec.EventHeader.ProcessId,
+            userData(rec),
+        ) orelse return;
+        if (self.dns_ring.push(ev) == .pushed_was_empty) self.wake.set();
+    }
+
     fn userData(rec: *win32.EVENT_RECORD) []const u8 {
         const p = rec.UserData orelse return &.{};
         return @as([*]const u8, @ptrCast(p))[0..rec.UserDataLength];
@@ -153,6 +182,7 @@ pub const Consumer = struct {
 const TestRig = struct {
     ring: *Ring,
     process_ring: *ProcessRing,
+    dns_ring: *DnsRing,
     wake: sync.WakeEvent,
     consumer: Consumer,
 
@@ -166,8 +196,11 @@ const TestRig = struct {
         self.process_ring = try gpa.create(ProcessRing);
         errdefer gpa.destroy(self.process_ring);
         self.process_ring.* = .{};
+        self.dns_ring = try gpa.create(DnsRing);
+        errdefer gpa.destroy(self.dns_ring);
+        self.dns_ring.* = .{};
         self.wake = try sync.WakeEvent.init();
-        self.consumer = Consumer.init(self.ring, self.process_ring, self.wake, gpa);
+        self.consumer = Consumer.init(self.ring, self.process_ring, self.dns_ring, self.wake, gpa);
         return self;
     }
 
@@ -175,6 +208,7 @@ const TestRig = struct {
         const gpa = std.testing.allocator;
         self.consumer.deinit();
         self.wake.deinit();
+        gpa.destroy(self.dns_ring);
         gpa.destroy(self.process_ring);
         gpa.destroy(self.ring);
         gpa.destroy(self);
@@ -225,6 +259,19 @@ const process_stop_payload = blk: {
     std.mem.writeInt(u32, b[0..4], 7777, .little);
     std.mem.writeInt(u64, b[4..12], 0xAA55, .little);
     std.mem.writeInt(u64, b[12..20], 0xAA99, .little);
+    break :blk b;
+};
+
+/// A valid 3008 v0 payload: QueryName "example.com", QueryType, QueryOptions,
+/// QueryStatus 0, QueryResults "93.184.216.34;".
+const dns_payload = blk: {
+    const name = "example.com";
+    const results = "93.184.216.34;";
+    var b: [2 * name.len + 2 + 16 + 2 * results.len + 2]u8 = @splat(0);
+    for (name, 0..) |c, i| b[2 * i] = c;
+    std.mem.writeInt(u32, b[2 * name.len + 2 ..][0..4], 28, .little); // QueryType
+    // QueryOptions (u64) and QueryStatus (u32) stay zero — success.
+    for (results, 0..) |c, i| b[2 * name.len + 2 + 16 + 2 * i] = c;
     break :blk b;
 };
 
@@ -321,7 +368,25 @@ test "unknown kernel-process versions route to the process TDH fallback" {
     try std.testing.expectEqual(@as(u32, 31337), ev.pid);
 }
 
-test "foreign providers and excluded events never reach either ring" {
+test "DNS-Client 3008 lands on the DNS ring, attributed to the header PID" {
+    const rig = try TestRig.init();
+    defer rig.deinit();
+
+    var rec = testRecord(etw_session.dns_client_guid, dns_parser.Id.query_completed, 0, &dns_payload, &rig.consumer);
+    // 3008 is emitted in-process: the header PID is the querying process.
+    rec.EventHeader.ProcessId = 42576;
+    Consumer.eventRecordCallback(&rec);
+
+    try std.testing.expect(rig.ring.isEmpty());
+    try std.testing.expect(rig.process_ring.isEmpty());
+    const ev = rig.dns_ring.pop() orelse return error.NothingPushed;
+    try std.testing.expectEqual(@as(u32, 42576), ev.pid);
+    try std.testing.expectEqualStrings("example.com", ev.name());
+    try std.testing.expectEqual(@as(usize, 1), ev.addresses().len);
+    try std.testing.expectEqual(sync.WakeEvent.WaitResult.signaled, rig.wake.timedWait(0));
+}
+
+test "foreign providers and excluded events never reach any ring" {
     const rig = try TestRig.init();
     defer rig.deinit();
     rig.consumer.process_fallback = &testProcessFallback;
@@ -338,8 +403,14 @@ test "foreign providers and excluded events never reach either ring" {
     var private_set = testRecord(etw_session.kernel_process_guid, 27, 0, &process_start_payload, &rig.consumer);
     Consumer.eventRecordCallback(&private_set);
 
+    // The DNS provider is enabled on all keywords, so its other 3000-series
+    // events arrive too — and drop here rather than at the session.
+    var query_called = testRecord(etw_session.dns_client_guid, 3006, 0, &dns_payload, &rig.consumer);
+    Consumer.eventRecordCallback(&query_called);
+
     try std.testing.expect(rig.ring.isEmpty());
     try std.testing.expect(rig.process_ring.isEmpty());
+    try std.testing.expect(rig.dns_ring.isEmpty());
     try std.testing.expectEqual(@as(u32, 0), test_process_fallback_calls);
     try std.testing.expectEqual(sync.WakeEvent.WaitResult.timeout, rig.wake.timedWait(0));
 }
