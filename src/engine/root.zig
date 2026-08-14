@@ -7,6 +7,7 @@ const std = @import("std");
 pub const consumer = @import("consumer.zig");
 pub const core = @import("core.zig");
 pub const device_map = @import("device_map.zig");
+pub const dns_cache = @import("dns_cache.zig");
 pub const dns_parser = @import("dns_parser.zig");
 pub const etw_session = @import("etw_session.zig");
 pub const event = @import("event.zig");
