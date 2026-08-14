@@ -13,6 +13,7 @@ pub const flows = @import("flows.zig");
 pub const parser = @import("parser.zig");
 pub const process_parser = @import("process_parser.zig");
 pub const process_tdh = @import("process_tdh.zig");
+pub const rates = @import("rates.zig");
 pub const runner = @import("runner.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const spsc_ring = @import("spsc_ring.zig");

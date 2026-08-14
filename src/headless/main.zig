@@ -1,9 +1,10 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
-//! issue #20's tracer plus issue #21's Process Rows and issue #22's Flows.
-//! Brings the `zPulsarNet` session up, runs the consumer and Engine threads,
-//! and renders a live per-process In-session Totals table from acquired
-//! Snapshots — real image names, dimmed "(exited)" rows, each row's Flows
-//! beneath it with Lingering ones dimmed, health flags. Requires elevation.
+//! issue #20's tracer plus issue #21's Process Rows, issue #22's Flows, and
+//! issue #23's rates. Brings the `zPulsarNet` session up, runs the consumer
+//! and Engine threads, and renders a live per-process table from acquired
+//! Snapshots — real image names, live down/up speeds, In-session Totals,
+//! dimmed "(exited)" rows, each row's Flows beneath it with Lingering ones
+//! dimmed, health flags. Requires elevation.
 //!
 //! Usage: zpulsar-headless [--duration <seconds>]
 //! Default runs until Ctrl+C.
@@ -126,7 +127,10 @@ fn writeTable(
     if (snap.health.rebaselined)
         try w.writeAll("   [RE-BASELINED: loss occurred, totals may undercount]");
     try w.writeAll("\n\n");
-    try w.print("{s:>8}  {s:>4}  {s:>4}  {s:>12}  {s:>12}  {s}\n", .{ "PID", "TCP", "UDP", "SENT", "RECV", "NAME" });
+    try w.print(
+        "{s:>8}  {s:>4}  {s:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}\n",
+        .{ "PID", "TCP", "UDP", "DOWN", "UP", "SENT", "RECV", "NAME" },
+    );
 
     // Busiest first; the Snapshot itself stays untouched (it is immutable —
     // sort a copy; on allocation failure fall back to PID order).
@@ -141,24 +145,33 @@ fn writeTable(
 
     var total_sent: u64 = 0;
     var total_recv: u64 = 0;
+    var down: u64 = 0;
+    var up: u64 = 0;
     for (snap.rows) |r| {
         total_sent += r.sent;
         total_recv += r.recv;
+        down += r.recv_rate;
+        up += r.sent_rate;
     }
 
     var sent_buf: [16]u8 = undefined;
     var recv_buf: [16]u8 = undefined;
+    var down_buf: [20]u8 = undefined;
+    var up_buf: [20]u8 = undefined;
     for (rows[0..shown]) |r| {
         if (r.exited and vt) try w.writeAll("\x1b[2m");
-        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s}{s}{s}", .{
+        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}{s}{s}", .{
             r.pid,
             r.tcp_conns,
             r.udp_socks,
+            fmtRate(r.recv_rate, &down_buf),
+            fmtRate(r.sent_rate, &up_buf),
             fmtBytes(r.sent, &sent_buf),
             fmtBytes(r.recv, &recv_buf),
             if (r.name.len > max_name_display) "…" else "",
             displayName(r.name),
-            if (r.exited) " (exited)" else "",
+            // The Evicted-processes Row says what it is in its own name.
+            if (r.exited and !r.evicted_processes) " (exited)" else "",
         });
         if (r.exited and vt) try w.writeAll("\x1b[22m");
         try w.writeAll("\n");
@@ -169,9 +182,12 @@ fn writeTable(
     }
     if (snap.rows.len > shown)
         try w.print("  … {d} more processes\n", .{snap.rows.len - shown});
-    try w.print("\n{d} processes   {d} flows   total sent {s}   recv {s}\n", .{
+    // The spec's status bar: flow count, global speeds, session totals.
+    try w.print("\n{d} processes   {d} flows   ↓ {s}  ↑ {s}   total sent {s}   recv {s}\n", .{
         snap.rows.len,
         snap.flows.len,
+        fmtRate(down, &down_buf),
+        fmtRate(up, &up_buf),
         fmtBytes(total_sent, &sent_buf),
         fmtBytes(total_recv, &recv_buf),
     });
@@ -190,13 +206,17 @@ fn writeFlow(w: *std.Io.Writer, f: engine.snapshot.Flow, vt: bool) !void {
     var rbuf: [64]u8 = undefined;
     var sbuf: [16]u8 = undefined;
     var rvbuf: [16]u8 = undefined;
+    var dbuf: [20]u8 = undefined;
+    var ubuf: [20]u8 = undefined;
     const dim = vt and f.lingering;
     if (dim) try w.writeAll("\x1b[2m");
-    try w.print("           {s} gen{d}  {s} -> {s}  {s} / {s}{s}\n", .{
+    try w.print("           {s} gen{d}  {s} -> {s}  ↓ {s} ↑ {s}  {s} / {s}{s}\n", .{
         @tagName(f.proto),
         f.generation,
         fmtEndpoint(f.family, f.local_addr, f.local_port, &lbuf),
         fmtEndpoint(f.family, f.remote_addr, f.remote_port, &rbuf),
+        fmtRate(f.recv_rate, &dbuf),
+        fmtRate(f.sent_rate, &ubuf),
         fmtBytes(f.sent, &sbuf),
         fmtBytes(f.recv, &rvbuf),
         if (f.lingering) "  [linger]" else "",
@@ -228,7 +248,12 @@ fn fmtEndpoint(family: engine.event.Family, addr: [16]u8, port: u16, buf: []u8) 
     }
 }
 
+/// Busiest first: current speed leads (that is what a live rig is for),
+/// session totals break the ties among the idle.
 fn rowBusierThan(_: void, a: engine.snapshot.Row, b: engine.snapshot.Row) bool {
+    const rate_a = a.sent_rate + a.recv_rate;
+    const rate_b = b.sent_rate + b.recv_rate;
+    if (rate_a != rate_b) return rate_a > rate_b;
     return a.sent + a.recv > b.sent + b.recv;
 }
 
@@ -253,6 +278,14 @@ fn fmtBytes(v: u64, buf: []u8) []const u8 {
         std.fmt.bufPrint(buf, "{d} B", .{v}) catch "?"
     else
         std.fmt.bufPrint(buf, "{d:.1} {s}", .{ val, units[unit] }) catch "?";
+}
+
+/// A Snapshot's precomputed speed, in the same decimal units. Idle reads as
+/// a dim dash rather than "0 B/s" — the spec's zero-value rule.
+fn fmtRate(bytes_per_s: u64, buf: []u8) []const u8 {
+    if (bytes_per_s == 0) return "—";
+    var inner: [16]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}/s", .{fmtBytes(bytes_per_s, &inner)}) catch "?";
 }
 
 fn enableVtProcessing() bool {

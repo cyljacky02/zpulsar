@@ -27,6 +27,11 @@ pub const Flow = struct {
     generation: u32,
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Precomputed speed in bytes per second: the 1 s sliding window over
+    /// this Flow's event-time rate ring (rates.zig). Readers display it as
+    /// published — a Snapshot never asks the Engine to compute anything.
+    sent_rate: u64 = 0,
+    recv_rate: u64 = 0,
     /// Closed but still visible, dimmed (CONTEXT.md "Linger").
     lingering: bool = false,
     remote_hostname: ?[]const u8 = null,
@@ -44,8 +49,17 @@ pub const Row = struct {
     name: []const u8 = "",
     /// Dimmed "(exited)" in the UI; totals stay intact.
     exited: bool = false,
+    /// The single "(evicted processes)" row: the exited rows that hit the
+    /// memory cap rolled their totals in here (CONTEXT.md "Eviction" —
+    /// attribution coarsens, bytes do not move). It owns no Flows and no PID.
+    evicted_processes: bool = false,
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Precomputed speed in bytes per second: the 1 s sliding window over
+    /// this Row's own event-time rate ring — the Row is bucketed alongside
+    /// its Flows, so this survives their Linger and their eviction.
+    sent_rate: u64 = 0,
+    recv_rate: u64 = 0,
     /// Live (non-Lingering) flow counts by protocol.
     tcp_conns: u32 = 0,
     udp_socks: u32 = 0,
