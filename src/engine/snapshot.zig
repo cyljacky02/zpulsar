@@ -8,9 +8,17 @@
 const std = @import("std");
 const sync = @import("sync.zig");
 
-/// One monitored PID's In-session Totals plus its current connection counts.
+/// One Process Row: a process instance's identity, In-session Totals, and
+/// current connection counts. Exited rows persist all session, so several
+/// rows may share a PID (at most one of them live).
 pub const Row = struct {
     pid: u32,
+    /// Display image path (drive-letter converted; bare name for
+    /// kernel/minimal processes). Empty until a start/rundown event names
+    /// the process. Arena-owned by this Snapshot.
+    name: []const u8 = "",
+    /// Dimmed "(exited)" in the UI; totals stay intact.
+    exited: bool = false,
     sent: u64 = 0,
     recv: u64 = 0,
     tcp_conns: u32 = 0,
@@ -111,12 +119,32 @@ pub fn mutableRows(snap: *Snapshot) []Row {
     return @constCast(snap.rows);
 }
 
+/// Copy `bytes` (e.g. a row's display name) into the Snapshot's own arena so
+/// the row data stays self-contained. Valid only between create and publish;
+/// the arena state is re-captured so release() frees these too.
+pub fn arenaDupe(snap: *Snapshot, bytes: []const u8) error{OutOfMemory}![]const u8 {
+    var arena = snap.arena_state.promote(snap.gpa);
+    defer snap.arena_state = arena.state;
+    return arena.allocator().dupe(u8, bytes);
+}
+
 test "release frees the whole arena exactly once" {
     // std.testing.allocator fails the test on leak or double-free.
     const snap = try create(std.testing.allocator, 100);
     snap.retain();
     snap.release();
     snap.release();
+}
+
+test "arena-duped names live and die with the snapshot" {
+    const snap = try create(std.testing.allocator, 1);
+    mutableRows(snap)[0] = .{
+        .pid = 7,
+        // Long enough to force the arena to grow a fresh buffer node.
+        .name = try arenaDupe(snap, "C:\\Windows\\System32\\svchost.exe" ** 40),
+    };
+    try std.testing.expect(std.mem.startsWith(u8, snap.rows[0].name, "C:\\Windows"));
+    snap.release(); // the allocator flags the name bytes if they leaked
 }
 
 test "publish transfers ownership and releases the replaced snapshot" {

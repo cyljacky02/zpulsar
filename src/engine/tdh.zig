@@ -29,7 +29,7 @@ pub fn parseWithOffsets(
     id: u16,
     off: FieldOffsets,
     user_data: []const u8,
-    timestamp_qpc: i64,
+    timestamp_ft: i64,
 ) ?event.NetEvent {
     const class = parser.classify(id) orelse return null;
     if (off.addr_len != 4 and off.addr_len != 16) return null;
@@ -45,7 +45,7 @@ pub fn parseWithOffsets(
         .remote_addr = @splat(0),
         .local_port = std.mem.readInt(u16, user_data[off.sport..][0..2], .big),
         .remote_port = std.mem.readInt(u16, user_data[off.dport..][0..2], .big),
-        .timestamp_qpc = timestamp_qpc,
+        .timestamp_ft = timestamp_ft,
     };
     if (class.op == .send or class.op == .recv)
         out.size = std.mem.readInt(u32, user_data[off.size..][0..4], .little);
@@ -198,7 +198,7 @@ pub const FallbackCache = struct {
         self: *FallbackCache,
         rec: *win32.EVENT_RECORD,
         user_data: []const u8,
-        timestamp_qpc: i64,
+        timestamp_ft: i64,
     ) ?event.NetEvent {
         const id = rec.EventHeader.EventDescriptor.Id;
         const version = rec.EventHeader.EventDescriptor.Version;
@@ -206,7 +206,7 @@ pub const FallbackCache = struct {
         const gop = self.map.getOrPut(self.gpa, cacheKey(id, version)) catch return null;
         if (!gop.found_existing) gop.value_ptr.* = self.derive(rec, self.gpa);
         const off = gop.value_ptr.* orelse return null;
-        return parseWithOffsets(id, off, user_data, timestamp_qpc);
+        return parseWithOffsets(id, off, user_data, timestamp_ft);
     }
 };
 

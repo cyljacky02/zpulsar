@@ -1,11 +1,12 @@
-//! Lifecycle of the `zPulsarNet` ETW real-time session (issue #19).
+//! Lifecycle of the `zPulsarNet` ETW real-time session (issues #19, #21).
 //!
 //! Session configuration follows the v1 spec (issue #18, "Capture: TCP/UDP
 //! byte accounting") and docs/research/etw-tcp-udp-pipeline.md: QPC clock,
 //! real-time mode, 16 KB buffers, min/max buffers 2×/4× logical CPUs, 1 s
-//! FlushTimer. A crash-orphaned session is self-healing: on
-//! ERROR_ALREADY_EXISTS the orphan is stopped by name and startup retried
-//! (ADR-0002).
+//! FlushTimer. Kernel-Network and Kernel-Process both enable into this one
+//! session (docs/research/kernel-process-etw.md). A crash-orphaned session
+//! is self-healing: on ERROR_ALREADY_EXISTS the orphan is stopped by name
+//! and startup retried (ADR-0002).
 
 const std = @import("std");
 const win32 = @import("win32");
@@ -45,6 +46,13 @@ pub const kernel_network_guid = win32.Guid.initString("7dd42a49-5329-4832-8dfd-4
 pub const kernel_network_keyword_ipv4: u64 = 0x10;
 pub const kernel_network_keyword_ipv6: u64 = 0x20;
 
+/// Microsoft-Windows-Kernel-Process manifest provider
+/// (docs/research/kernel-process-etw.md §1.1): WINEVENT_KEYWORD_PROCESS
+/// only — thread/image-load keywords are that provider's high-volume side
+/// and stay off.
+pub const kernel_process_guid = win32.Guid.initString("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716");
+pub const kernel_process_keyword_process: u64 = 0x10;
+
 pub const StartError = error{
     /// The controlling APIs require elevation; startup is fail-fast (ADR-0002).
     AccessDenied,
@@ -78,6 +86,23 @@ pub const Session = struct {
         _ = win32.ControlTraceW(self.handle, null, &buf.props, .FLUSH);
     }
 
+    /// Ask Kernel-Process to log its state: one ProcessRundown (ID 15) event
+    /// per live process. Rundown is not keyword-gated — only this control
+    /// call triggers it (research §1.2). Issued after the consumer is live
+    /// (cold start), and re-issued as part of loss recovery.
+    pub fn captureState(self: Session) void {
+        _ = win32.EnableTraceEx2(
+            self.handle,
+            &kernel_process_guid,
+            win32.EVENT_CONTROL_CODE_CAPTURE_STATE,
+            win32.TRACE_LEVEL_INFORMATION,
+            kernel_process_keyword_process,
+            0,
+            0,
+            null,
+        );
+    }
+
     /// Cumulative events the session lost, both channels: EventsLost (buffer
     /// exhaustion at write time) plus RealTimeBuffersLost (buffers undeliverable
     /// to the real-time consumer). Null when the query itself fails. Any
@@ -91,9 +116,9 @@ pub const Session = struct {
     }
 };
 
-/// Start the `zPulsarNet` session and enable Kernel-Network (IPv4|IPv6).
-/// On ERROR_ALREADY_EXISTS the orphaned session is stopped by name and the
-/// start retried once.
+/// Start the `zPulsarNet` session and enable Kernel-Network (IPv4|IPv6) and
+/// Kernel-Process (keyword 0x10, level 4). On ERROR_ALREADY_EXISTS the
+/// orphaned session is stopped by name and the start retried once.
 pub fn start(logical_cpus: u32) StartError!Session {
     return startWith(Win32Ops, logical_cpus);
 }
@@ -130,14 +155,18 @@ fn startWith(comptime Ops: type, logical_cpus: u32) StartError!Session {
         else => return error.StartFailed,
     }
 
-    const enable_rc = Ops.enableProvider(
-        handle,
-        &kernel_network_guid,
-        kernel_network_keyword_ipv4 | kernel_network_keyword_ipv6,
-    );
-    if (enable_rc != .NO_ERROR) {
-        _ = stopByNameWith(Ops);
-        return error.EnableFailed;
+    const enables = [_]struct { guid: *const win32.Guid, keywords: u64 }{
+        .{
+            .guid = &kernel_network_guid,
+            .keywords = kernel_network_keyword_ipv4 | kernel_network_keyword_ipv6,
+        },
+        .{ .guid = &kernel_process_guid, .keywords = kernel_process_keyword_process },
+    };
+    for (enables) |e| {
+        if (Ops.enableProvider(handle, e.guid, e.keywords) != .NO_ERROR) {
+            _ = stopByNameWith(Ops);
+            return error.EnableFailed;
+        }
     }
 
     return .{ .handle = handle, .adopted_orphan = adopted_orphan };
@@ -194,15 +223,17 @@ const Win32Ops = struct {
 };
 
 const TestOps = struct {
-    const Call = enum { start, stop_by_name, enable };
+    const Call = enum { start, stop_by_name, enable_network, enable_process };
 
     var calls_buf: [8]Call = undefined;
     var calls_len: usize = 0;
     var start_rcs: []const win32.WIN32_ERROR = &.{};
     var stop_rc: win32.WIN32_ERROR = .NO_ERROR;
-    var enable_rc: win32.WIN32_ERROR = .NO_ERROR;
+    var enable_network_rc: win32.WIN32_ERROR = .NO_ERROR;
+    var enable_process_rc: win32.WIN32_ERROR = .NO_ERROR;
     var starts_seen: usize = 0;
-    var enabled_keywords: u64 = 0;
+    var network_keywords: u64 = 0;
+    var process_keywords: u64 = 0;
 
     fn record(call: Call) void {
         calls_buf[calls_len] = call;
@@ -217,9 +248,11 @@ const TestOps = struct {
         calls_len = 0;
         start_rcs = start_results;
         stop_rc = .NO_ERROR;
-        enable_rc = .NO_ERROR;
+        enable_network_rc = .NO_ERROR;
+        enable_process_rc = .NO_ERROR;
         starts_seen = 0;
-        enabled_keywords = 0;
+        network_keywords = 0;
+        process_keywords = 0;
     }
 
     fn startTrace(
@@ -252,24 +285,30 @@ const TestOps = struct {
         any_keywords: u64,
     ) win32.WIN32_ERROR {
         std.debug.assert(handle == 42);
-        std.debug.assert(std.mem.eql(u8, &provider.Bytes, &kernel_network_guid.Bytes));
-        record(.enable);
-        enabled_keywords = any_keywords;
-        return enable_rc;
+        if (std.mem.eql(u8, &provider.Bytes, &kernel_network_guid.Bytes)) {
+            record(.enable_network);
+            network_keywords = any_keywords;
+            return enable_network_rc;
+        }
+        std.debug.assert(std.mem.eql(u8, &provider.Bytes, &kernel_process_guid.Bytes));
+        record(.enable_process);
+        process_keywords = any_keywords;
+        return enable_process_rc;
     }
 };
 
-test "clean start enables Kernel-Network with IPv4|IPv6 keywords" {
+test "clean start enables Kernel-Network (IPv4|IPv6) and Kernel-Process (0x10)" {
     TestOps.reset(&.{.NO_ERROR});
     const session = try startWith(TestOps, 4);
     try std.testing.expectEqual(@as(win32.CONTROLTRACE_HANDLE, 42), session.handle);
     try std.testing.expect(!session.adopted_orphan);
     try std.testing.expectEqualSlices(
         TestOps.Call,
-        &.{ .start, .enable },
+        &.{ .start, .enable_network, .enable_process },
         TestOps.callsSeen(),
     );
-    try std.testing.expectEqual(@as(u64, 0x10 | 0x20), TestOps.enabled_keywords);
+    try std.testing.expectEqual(@as(u64, 0x10 | 0x20), TestOps.network_keywords);
+    try std.testing.expectEqual(@as(u64, 0x10), TestOps.process_keywords);
 }
 
 test "already-exists: orphan stopped by name, then start retried" {
@@ -278,7 +317,7 @@ test "already-exists: orphan stopped by name, then start retried" {
     try std.testing.expect(session.adopted_orphan);
     try std.testing.expectEqualSlices(
         TestOps.Call,
-        &.{ .start, .stop_by_name, .start, .enable },
+        &.{ .start, .stop_by_name, .start, .enable_network, .enable_process },
         TestOps.callsSeen(),
     );
 }
@@ -295,11 +334,22 @@ test "access denied maps to its own error" {
 
 test "enable failure stops the just-started session" {
     TestOps.reset(&.{.NO_ERROR});
-    TestOps.enable_rc = .ERROR_ACCESS_DENIED;
+    TestOps.enable_network_rc = .ERROR_ACCESS_DENIED;
     try std.testing.expectError(error.EnableFailed, startWith(TestOps, 4));
     try std.testing.expectEqualSlices(
         TestOps.Call,
-        &.{ .start, .enable, .stop_by_name },
+        &.{ .start, .enable_network, .stop_by_name },
+        TestOps.callsSeen(),
+    );
+}
+
+test "a failing second enable also stops the session — never a half-enabled tracer" {
+    TestOps.reset(&.{.NO_ERROR});
+    TestOps.enable_process_rc = .ERROR_ACCESS_DENIED;
+    try std.testing.expectError(error.EnableFailed, startWith(TestOps, 4));
+    try std.testing.expectEqualSlices(
+        TestOps.Call,
+        &.{ .start, .enable_network, .enable_process, .stop_by_name },
         TestOps.callsSeen(),
     );
 }

@@ -51,6 +51,10 @@ pub const TRACE_LEVEL_INFORMATION: u8 = @intCast(etw.TRACE_LEVEL_INFORMATION);
 /// `EnableTraceEx2` takes ControlCode as `u32`; the upstream constant is an enum.
 pub const EVENT_CONTROL_CODE_ENABLE_PROVIDER: u32 =
     @intFromEnum(etw.EVENT_CONTROL_CODE_ENABLE_PROVIDER);
+/// The rundown request: makes an enabled provider log its state (one
+/// ProcessRundown event per live process for Kernel-Process).
+pub const EVENT_CONTROL_CODE_CAPTURE_STATE: u32 =
+    @intFromEnum(etw.EVENT_CONTROL_CODE_CAPTURE_STATE);
 
 // ---------------------------------------------------------------------------
 // ETW consumption (advapi32) — the consumer thread (issue #20)
@@ -79,8 +83,11 @@ pub const INVALID_PROCESSTRACE_HANDLE: PROCESSTRACE_HANDLE = std.math.maxInt(u64
 // ---------------------------------------------------------------------------
 
 pub const TdhGetEventInformation = zigwin32.tdh.TdhGetEventInformation;
+pub const TdhGetProperty = zigwin32.tdh.TdhGetProperty;
+pub const TdhGetPropertySize = zigwin32.tdh.TdhGetPropertySize;
 pub const TRACE_EVENT_INFO = etw.TRACE_EVENT_INFO;
 pub const EVENT_PROPERTY_INFO = etw.EVENT_PROPERTY_INFO;
+pub const PROPERTY_DATA_DESCRIPTOR = etw.PROPERTY_DATA_DESCRIPTOR;
 
 /// The true SDK signature of the ETW buffer callback:
 /// `ULONG (WINAPI *PEVENT_TRACE_BUFFER_CALLBACKW)(PEVENT_TRACE_LOGFILEW)`
@@ -118,6 +125,14 @@ pub const MIB_UDP6TABLE_OWNER_PID = ip_helper.MIB_UDP6TABLE_OWNER_PID;
 /// `u32`; zigwin32's `AF_*` are `ADDRESS_FAMILY` enum(u16) values.
 pub const AF_INET: u32 = @intFromEnum(win_sock.AF_INET);
 pub const AF_INET6: u32 = @intFromEnum(win_sock.AF_INET6);
+
+// ---------------------------------------------------------------------------
+// DOS device mapping (kernel32) — NT device path → drive letter display
+// ---------------------------------------------------------------------------
+
+pub const QueryDosDeviceW = zigwin32.kernel32.QueryDosDeviceW;
+/// Bit N set = drive 'A'+N exists.
+pub const GetLogicalDrives = zigwin32.kernel32.GetLogicalDrives;
 
 // ---------------------------------------------------------------------------
 // Console control (kernel32)
@@ -258,6 +273,12 @@ comptime {
     assert(@offsetOf(EVENT_PROPERTY_INFO, "Anonymous2") == 16); // count
     assert(@offsetOf(EVENT_PROPERTY_INFO, "Anonymous3") == 18); // length
     assert(@offsetOf(EVENT_PROPERTY_INFO, "Anonymous4") == 20); // tags
+
+    // tdh.h PROPERTY_DATA_DESCRIPTOR (TdhGetProperty input)
+    assert(@sizeOf(PROPERTY_DATA_DESCRIPTOR) == 16);
+    assert(@offsetOf(PROPERTY_DATA_DESCRIPTOR, "PropertyName") == 0);
+    assert(@offsetOf(PROPERTY_DATA_DESCRIPTOR, "ArrayIndex") == 8);
+    assert(@offsetOf(PROPERTY_DATA_DESCRIPTOR, "Reserved") == 12);
 
     // tcpmib.h MIB_TCPROW_OWNER_PID / MIB_TCPTABLE_OWNER_PID
     assert(@sizeOf(MIB_TCPROW_OWNER_PID) == 24);
