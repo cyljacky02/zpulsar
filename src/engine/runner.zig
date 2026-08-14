@@ -11,6 +11,9 @@ const consumer_mod = @import("consumer.zig");
 const core_mod = @import("core.zig");
 const device_map = @import("device_map.zig");
 const etw_session = @import("etw_session.zig");
+const rates = @import("rates.zig");
+const resolver = @import("resolver.zig");
+const reverse_lookup = @import("reverse_lookup.zig");
 const snapshot = @import("snapshot.zig");
 const sync = @import("sync.zig");
 const tables = @import("tables.zig");
@@ -28,6 +31,9 @@ const loss_check_every_ticks: u32 = 8;
 /// Publishing is cheap but allocates an arena; bound it below the flush
 /// cadence so a trickle byte still surfaces within the latency budget.
 const min_publish_interval_ms: u64 = 50;
+/// ADR-0002: shutdown may abandon a stuck resolver thread rather than hang
+/// behind a lookup that is documented as slow.
+const resolver_join_timeout_ms: u32 = 2_000;
 
 pub const StartError = error{
     OutOfMemory,
@@ -43,8 +49,15 @@ pub const Engine = struct {
     session: etw_session.Session,
     ring: *consumer_mod.Ring,
     process_ring: *consumer_mod.ProcessRing,
+    dns_ring: *consumer_mod.DnsRing,
     consumer: *consumer_mod.Consumer,
+    /// Null when the lane could not be brought up: hostname observation still
+    /// works, unresolved Flows just keep their bare endpoints.
+    reverse: ?*reverse_lookup.Lane,
     core: core_mod.Core,
+    /// Metadata resolver lane (ADR-0002 thread 4): the service map and
+    /// per-socket owner-module lookups Service Attribution needs.
+    lane: *resolver.Lane,
     published: snapshot.Published,
     ring_wake: sync.WakeEvent,
     stop_requested: std.atomic.Value(bool) = .init(false),
@@ -54,6 +67,7 @@ pub const Engine = struct {
     events_lost: u64 = 0,
     consumer_thread: std.Thread = undefined,
     engine_thread: std.Thread = undefined,
+    resolver_thread: std.Thread = undefined,
 
     /// Bring the hot path up on an already-started session. Order per the
     /// research docs: consumer handle opens first (events buffer in the
@@ -74,15 +88,28 @@ pub const Engine = struct {
         errdefer gpa.destroy(process_ring);
         process_ring.* = .{};
 
+        const dns_ring = try gpa.create(consumer_mod.DnsRing);
+        errdefer gpa.destroy(dns_ring);
+        dns_ring.* = .{};
+
         const cons = try gpa.create(consumer_mod.Consumer);
         errdefer gpa.destroy(cons);
 
+        const lane = try gpa.create(resolver.Lane);
+        errdefer gpa.destroy(lane);
+        try lane.init(gpa, resolver.system_lookups);
+        errdefer lane.deinit();
+
         var ring_wake = try sync.WakeEvent.init();
         errdefer ring_wake.deinit();
+        // An answer wakes the Engine thread the same way a ring record does,
+        // so an upgrade lands within the latency budget rather than at the
+        // next flush tick.
+        lane.wakeOnCompletion(ring_wake);
         var published = try snapshot.Published.init();
         errdefer published.deinit();
 
-        cons.* = .init(ring, process_ring, ring_wake, gpa);
+        cons.* = .init(ring, process_ring, dns_ring, ring_wake, gpa);
         errdefer cons.deinit();
 
         self.* = .{
@@ -90,12 +117,16 @@ pub const Engine = struct {
             .session = session,
             .ring = ring,
             .process_ring = process_ring,
+            .dns_ring = dns_ring,
             .consumer = cons,
+            .reverse = startReverseLane(gpa),
             .core = .init(gpa),
+            .lane = lane,
             .published = published,
             .ring_wake = ring_wake,
         };
         errdefer self.core.deinit();
+        self.core.reverse = self.reverse;
 
         // Display-only: a failed drive map just leaves names as raw NT paths.
         self.core.drive_map = device_map.query(gpa) catch .{};
@@ -109,6 +140,16 @@ pub const Engine = struct {
         defer gpa.free(rows);
         try self.core.reconcile(rows, 0);
 
+        // Service Attribution's map is wanted before the first Flow needs it,
+        // so ask for it up front rather than on the first miss.
+        self.core.requestServiceMap(0);
+
+        self.resolver_thread = std.Thread.spawn(.{}, resolver.Lane.run, .{lane}) catch
+            return error.SpawnFailed;
+        errdefer {
+            lane.shutdown();
+            self.resolver_thread.join();
+        }
         self.consumer_thread = std.Thread.spawn(.{}, consumer_mod.Consumer.run, .{cons}) catch
             return error.SpawnFailed;
         // ICMP last, and only now: the enable itself triggers TCPIP's
@@ -135,6 +176,23 @@ pub const Engine = struct {
         return self;
     }
 
+    /// Bring the reverse-lookup lane up. A failure here is not fatal — the
+    /// spec's fallback is itself a fallback, so the Engine runs without it and
+    /// Flows that miss every tier keep their bare endpoints.
+    fn startReverseLane(gpa: std.mem.Allocator) ?*reverse_lookup.Lane {
+        const lane = gpa.create(reverse_lookup.Lane) catch return null;
+        lane.* = reverse_lookup.Lane.init() catch {
+            gpa.destroy(lane);
+            return null;
+        };
+        lane.start() catch {
+            lane.deinit();
+            gpa.destroy(lane);
+            return null;
+        };
+        return lane;
+    }
+
     /// Full ordered shutdown, session stop included — ControlTrace(STOP) is
     /// never skipped, and it is what deterministically unblocks ProcessTrace.
     pub fn stop(self: *Engine) void {
@@ -146,12 +204,43 @@ pub const Engine = struct {
         self.engine_thread.join();
 
         const gpa = self.gpa;
+        // The Engine thread is gone, so nothing else touches the lane now.
+        // A lookup already in flight cannot be cancelled — the owner-module
+        // calls are documented as slow — so give it a bounded wait and then
+        // walk away (ADR-0002). An abandoned lane keeps its thread, its
+        // memory, and its allocator alive until the process exits; that is
+        // the deliberate trade, and the OS reclaims all of it.
+        self.lane.shutdown();
+        const lane_exited = self.lane.waitExit(resolver_join_timeout_ms);
+        if (lane_exited) {
+            self.resolver_thread.join();
+            self.lane.deinit();
+            gpa.destroy(self.lane);
+        } else {
+            self.resolver_thread.detach();
+        }
+
         self.consumer.deinit();
         gpa.destroy(self.consumer);
         gpa.destroy(self.ring);
         gpa.destroy(self.process_ring);
+        gpa.destroy(self.dns_ring);
+        if (self.reverse) |lane| switch (lane.stop()) {
+            .joined => {
+                lane.deinit();
+                gpa.destroy(lane);
+            },
+            // Still inside a blocking GetNameInfoW past the 2 s timeout: the
+            // thread is abandoned and its Lane leaked on purpose (ADR-0002).
+            // Freeing it — or closing its handles — is what would be unsafe;
+            // the process is exiting anyway.
+            .abandoned => {},
+        };
         self.published.deinit();
-        self.ring_wake.deinit();
+        // An abandoned lane still signals this event when its lookup finally
+        // returns, so closing the handle would leave it setting whatever the
+        // OS hands out next. It leaks with the rest of the abandoned lane.
+        if (lane_exited) self.ring_wake.deinit();
         self.core.deinit();
         gpa.destroy(self);
     }
@@ -175,7 +264,11 @@ pub const Engine = struct {
 
         while (!self.stop_requested.load(.acquire)) {
             const drain_now = win32.GetTickCount64() - t0;
-            // Identity first: a start/rundown drained before its instance's
+            // Metadata first: a service map or owner-module answer applied
+            // before this pass's traffic means the Flows it opens are
+            // classified straight away, rather than a tick later.
+            self.core.drainCompletions(self.lane, drain_now);
+            // Identity next: a start/rundown drained before its instance's
             // traffic saves the placeholder round trip.
             while (self.process_ring.pop()) |pev| {
                 self.core.applyProcess(pev, drain_now) catch {
@@ -187,6 +280,22 @@ pub const Engine = struct {
                     self.oom_drops += 1;
                 };
             }
+            // Observations next: a resolution drained after the connect it
+            // preceded still upgrades the Flow in place, so ordering here is
+            // a nicety rather than a correctness requirement.
+            //
+            // A dropped observation is deliberately *not* counted as ring
+            // loss: it costs a name, never a byte, and the affected Flows
+            // fall through to the reverse-lookup lane. Feeding it into the
+            // loss signal would re-baseline the totals and flag them as
+            // possibly low over something that never touched them.
+            while (self.dns_ring.pop()) |dev| {
+                self.core.applyDns(dev, drain_now) catch {};
+            }
+            // Every Flow opened above asked for its service while its
+            // owner-table row was still fresh; post that work now, before the
+            // pass can go to sleep.
+            self.core.submitOutbox(self.lane);
 
             const now = win32.GetTickCount64() - t0;
             if (now - last_flush >= flush_interval_ms) {
@@ -200,9 +309,9 @@ pub const Engine = struct {
                     self.oom_drops;
                 if (self.core.noteLoss(ring_loss, self.events_lost))
                     self.rebaseline(now);
-                // Flow lifecycle rides the flush tick: Linger expiry and UDP
-                // age-out. OOM leaves the table unchanged; the next tick
-                // retries.
+                // Flow lifecycle rides the flush tick: Linger expiry, UDP
+                // age-out, and the memory caps. OOM leaves the state
+                // unchanged; the next tick retries.
                 self.core.tick(now) catch {};
                 if (now - last_sweep >= sweep_interval_ms) {
                     last_sweep = now;
@@ -211,7 +320,10 @@ pub const Engine = struct {
             }
 
             if (self.core.dirty and now - last_publish >= min_publish_interval_ms) {
-                if (self.core.buildSnapshot()) |snap| {
+                // Speeds are read on the clock the events were stamped with,
+                // not this loop's monotonic tick (rates.zig).
+                const event_now = rates.msFromFileTime(win32.systemTimeAsFileTime());
+                if (self.core.buildSnapshot(event_now)) |snap| {
                     self.published.publish(snap);
                     last_publish = now;
                 } else |_| {} // OOM: retry next pass

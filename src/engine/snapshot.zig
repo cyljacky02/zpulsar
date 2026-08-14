@@ -7,12 +7,12 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const hostnames = @import("hostnames.zig");
 const sync = @import("sync.zig");
 
-/// One Flow as published: identity, Generation, totals, and whether it is
-/// riding out its Linger window (dimmed in the UI). Hostname and service
-/// attribution are later tickets — the fields are part of the v1 shape but
-/// stay unpopulated here.
+/// One Flow as published: identity, Generation, totals, whether it is riding
+/// out its Linger window (dimmed in the UI), its remote name, and its Service
+/// Attribution.
 pub const Flow = struct {
     proto: event.Proto,
     family: event.Family,
@@ -36,9 +36,30 @@ pub const Flow = struct {
     /// TCP and UDP.
     msgs_sent: u64 = 0,
     msgs_recv: u64 = 0,
+    /// Precomputed speed in bytes per second: the 1 s sliding window over
+    /// this Flow's event-time rate ring (rates.zig). Readers display it as
+    /// published — a Snapshot never asks the Engine to compute anything.
+    /// Always zero for ICMP, which moves no bytes to bucket; its activity is
+    /// the message counts above.
+    sent_rate: u64 = 0,
+    recv_rate: u64 = 0,
     /// Closed but still visible, dimmed (CONTEXT.md "Linger").
     lingering: bool = false,
+    /// The name resolved once at Flow creation and stored (CONTEXT.md
+    /// "Hostname Attribution"); null shows the bare endpoint. Arena-owned by
+    /// this Snapshot.
     remote_hostname: ?[]const u8 = null,
+    /// The CNAME chain's tail behind `remote_hostname`, when the answer had
+    /// one — the name the address actually belongs to.
+    remote_alias: ?[]const u8 = null,
+    /// Which tier produced `remote_hostname`. Only `observed` is the name the
+    /// process actually resolved; hints render dimmed with their own marker.
+    hostname_origin: hostnames.Origin = .observed,
+    /// The Windows service that owns this Flow (issue #25): its Process Row's
+    /// only service, or the one resolved per-socket inside a shared host.
+    /// Null means no service could honestly be named — the UI falls back to
+    /// the row's "name (N services)" label rather than guess one of them.
+    /// Arena-owned by this Snapshot.
     service: ?[]const u8 = null,
 };
 
@@ -53,15 +74,33 @@ pub const Row = struct {
     name: []const u8 = "",
     /// Dimmed "(exited)" in the UI; totals stay intact.
     exited: bool = false,
+    /// The single "(evicted processes)" row: the exited rows that hit the
+    /// memory cap rolled their totals in here (CONTEXT.md "Eviction" —
+    /// attribution coarsens, bytes do not move). It owns no Flows and no PID.
+    evicted_processes: bool = false,
     /// In-session Totals, bytes. ICMP contributes nothing to either.
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Precomputed speed in bytes per second: the 1 s sliding window over
+    /// this Row's own event-time rate ring — the Row is bucketed alongside
+    /// its Flows, so this survives their Linger and their eviction.
+    sent_rate: u64 = 0,
+    recv_rate: u64 = 0,
     /// Live (non-Lingering) flow counts by protocol.
     tcp_conns: u32 = 0,
     udp_socks: u32 = 0,
     icmp_flows: u32 = 0,
     /// This row's Flows, live and Lingering — a slice of Snapshot.flows.
     flows: []const Flow = &.{},
+    /// The Windows services this process hosts, from the SCM map (issue #25),
+    /// sorted; empty for a process that hosts none, and for one whose service
+    /// status is not known yet. Exactly one entry means the row *is* that
+    /// service (CONTEXT.md "Process Row") and every Flow of the row carries
+    /// it. Two or more means a shared service host: each Flow carries the
+    /// service that owns its socket, or — when per-socket resolution fails —
+    /// nothing, and the UI shows the honest "name (N services)" fallback with
+    /// this list. Arena-owned by this Snapshot.
+    services: []const []const u8 = &.{},
 };
 
 pub const Health = struct {
@@ -73,6 +112,10 @@ pub const Health = struct {
     ring_dropped: u64 = 0,
     /// Cumulative EventsLost reported by the ETW session.
     etw_events_lost: u64 = 0,
+    /// Cumulative Service Attribution lookups the Engine could not hand to
+    /// the resolver lane (issue #25). Costs labels, never bytes: each one is
+    /// a Flow left under the honest fallback.
+    service_lookups_dropped: u64 = 0,
 };
 
 pub const Snapshot = struct {
@@ -179,6 +222,20 @@ pub fn arenaDupe(snap: *Snapshot, bytes: []const u8) error{OutOfMemory}![]const 
     var arena = snap.arena_state.promote(snap.gpa);
     defer snap.arena_state = arena.state;
     return arena.allocator().dupe(u8, bytes);
+}
+
+/// Same for a list of strings (a row's hosted-service names): both the outer
+/// slice and every string land in the Snapshot's arena, so a held Snapshot
+/// stays self-contained even after the Engine replaces its service map.
+pub fn arenaDupeStrings(
+    snap: *Snapshot,
+    list: []const []const u8,
+) error{OutOfMemory}![]const []const u8 {
+    var arena = snap.arena_state.promote(snap.gpa);
+    defer snap.arena_state = arena.state;
+    const out = try arena.allocator().alloc([]const u8, list.len);
+    for (list, out) |src, *dst| dst.* = try arena.allocator().dupe(u8, src);
+    return out;
 }
 
 test "release frees the whole arena exactly once" {

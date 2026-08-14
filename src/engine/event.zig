@@ -99,6 +99,72 @@ pub const ProcessEvent = struct {
     }
 };
 
+/// One address as the name tiers key it: family plus raw network-order bytes,
+/// v4 in the first 4.
+pub const IpAddr = struct {
+    family: Family,
+    addr: [16]u8,
+
+    /// The canonical form for name keying: an IPv4-mapped IPv6 address
+    /// (`::ffff:a.b.c.d`, RFC 4291 §2.5.5.2) is the v4 address it stands for.
+    ///
+    /// Both sides can produce the mapped form — the resolver reports a
+    /// dual-family lookup's v4 answers that way
+    /// (docs/research/dns-client-etw.md §4), and a dual-stack socket's
+    /// Kernel-Network v6 events carry it too — so both normalize through here
+    /// or a Flow could never match its own observation. Flow *identity* is
+    /// untouched: this is the naming key, not the Flow key.
+    pub fn normalized(self: IpAddr) IpAddr {
+        if (self.family != .v6) return self;
+        if (!std.mem.allEqual(u8, self.addr[0..10], 0)) return self;
+        if (self.addr[10] != 0xff or self.addr[11] != 0xff) return self;
+        var mapped: [16]u8 = @splat(0);
+        @memcpy(mapped[0..4], self.addr[12..16]);
+        return .{ .family = .v4, .addr = mapped };
+    }
+};
+
+/// Longest hostname kept: the DNS wire limit is 253 characters (RFC 1035
+/// §2.3.4). Longer names truncate — a display concern only; nothing keys on
+/// the name.
+pub const max_hostname_bytes = 256;
+
+/// Addresses kept from one completed resolution. CDN answers routinely carry
+/// several; beyond this the tail is dropped, costing only the names of flows
+/// to the least-preferred answers.
+pub const max_dns_addresses = 8;
+
+/// Fixed-size Microsoft-Windows-DNS-Client 3008 record for the DNS ring
+/// (docs/research/dns-client-etw.md §5): one completed resolution — the name
+/// the process asked for, the CNAME chain's tail, and the addresses it
+/// resolved to. Names are UTF-8: the payload's UTF-16 is converted at parse
+/// time, on the consumer thread, without allocating.
+pub const DnsEvent = struct {
+    /// The querying process, from EVENT_HEADER.ProcessId — 3008 is emitted
+    /// in-process and has no PID payload field (research §2).
+    pid: u32,
+    name_len: u16,
+    alias_len: u16,
+    addr_count: u8,
+    name_buf: [max_hostname_bytes]u8,
+    /// The CNAME chain's tail — the name the addresses actually belong to,
+    /// kept for optional display. Empty when the answer had no CNAME.
+    alias_buf: [max_hostname_bytes]u8,
+    addrs: [max_dns_addresses]IpAddr,
+
+    pub fn name(self: *const DnsEvent) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    pub fn alias(self: *const DnsEvent) []const u8 {
+        return self.alias_buf[0..self.alias_len];
+    }
+
+    pub fn addresses(self: *const DnsEvent) []const IpAddr {
+        return self.addrs[0..self.addr_count];
+    }
+};
+
 /// Identity of one connection for cold-start reconciliation: events racing
 /// the table snapshot dedupe on this key (spec issue #18 "Cold start").
 /// The owner tables know UDP sockets by local endpoint only, so UDP keys zero
@@ -137,6 +203,23 @@ fn testEvent(proto: Proto) NetEvent {
         .remote_port = 443,
         .timestamp_ft = 0,
     };
+}
+
+test "an IPv4-mapped IPv6 address keys as the v4 address it stands for" {
+    const mapped: IpAddr = .{ .family = .v6, .addr = [12]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
+    } ++ [4]u8{ 104, 20, 23, 154 } };
+    const expected: IpAddr = .{
+        .family = .v4,
+        .addr = [4]u8{ 104, 20, 23, 154 } ++ @as([12]u8, @splat(0)),
+    };
+    try std.testing.expectEqual(expected, mapped.normalized());
+    // Idempotent, and a real v6 address is left exactly as it is.
+    try std.testing.expectEqual(expected, expected.normalized());
+    const real_v6: IpAddr = .{ .family = .v6, .addr = [16]u8{
+        0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0x68, 0x10, 0x85, 0xe5,
+    } };
+    try std.testing.expectEqual(real_v6, real_v6.normalized());
 }
 
 test "TCP conn key carries the full normalized 5-tuple" {

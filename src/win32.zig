@@ -13,6 +13,7 @@ const etw = zigwin32.system.diagnostics.etw;
 const ip_helper = zigwin32.network_management.ip_helper;
 const win_sock = zigwin32.networking.win_sock;
 const foundation = zigwin32.foundation;
+const services = zigwin32.system.services;
 
 // ---------------------------------------------------------------------------
 // Foundation
@@ -30,6 +31,10 @@ pub const WIN32_ERROR = foundation.WIN32_ERROR;
 /// typed `WIN32_ERROR`.
 pub const ERROR_SUCCESS: u32 = 0;
 pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+pub const GetLastError = zigwin32.kernel32.GetLastError;
+/// The SCM enumeration's "buffer too small, resume where you stopped" signal.
+pub const ERROR_MORE_DATA: WIN32_ERROR = .ERROR_MORE_DATA;
 
 // ---------------------------------------------------------------------------
 // ETW session control (advapi32)
@@ -130,6 +135,109 @@ pub const AF_INET: u32 = @intFromEnum(win_sock.AF_INET);
 pub const AF_INET6: u32 = @intFromEnum(win_sock.AF_INET6);
 
 // ---------------------------------------------------------------------------
+// IP Helper — per-socket owner modules (Service Attribution tier 2, issue #25)
+// ---------------------------------------------------------------------------
+
+/// `OwningModuleInfo` is documented only as "an array of opaque data that
+/// contains ownership information"; these functions are the documented way to
+/// turn it into a name, which Microsoft states "can be … a service name (such
+/// as 'RPC')". Reading it as a raw service tag and calling
+/// `I_QueryTagInformation` is the undocumented fast path — deliberately not
+/// used (research §3).
+pub const GetOwnerModuleFromTcpEntry = zigwin32.iphlpapi.GetOwnerModuleFromTcpEntry;
+pub const GetOwnerModuleFromTcp6Entry = zigwin32.iphlpapi.GetOwnerModuleFromTcp6Entry;
+pub const GetOwnerModuleFromUdpEntry = zigwin32.iphlpapi.GetOwnerModuleFromUdpEntry;
+pub const GetOwnerModuleFromUdp6Entry = zigwin32.iphlpapi.GetOwnerModuleFromUdp6Entry;
+
+pub const MIB_TCPROW_OWNER_MODULE = ip_helper.MIB_TCPROW_OWNER_MODULE;
+pub const MIB_TCP6ROW_OWNER_MODULE = ip_helper.MIB_TCP6ROW_OWNER_MODULE;
+pub const MIB_UDPROW_OWNER_MODULE = ip_helper.MIB_UDPROW_OWNER_MODULE;
+pub const MIB_UDP6ROW_OWNER_MODULE = ip_helper.MIB_UDP6ROW_OWNER_MODULE;
+pub const MIB_TCPTABLE_OWNER_MODULE = ip_helper.MIB_TCPTABLE_OWNER_MODULE;
+pub const MIB_TCP6TABLE_OWNER_MODULE = ip_helper.MIB_TCP6TABLE_OWNER_MODULE;
+pub const MIB_UDPTABLE_OWNER_MODULE = ip_helper.MIB_UDPTABLE_OWNER_MODULE;
+pub const MIB_UDP6TABLE_OWNER_MODULE = ip_helper.MIB_UDP6TABLE_OWNER_MODULE;
+
+pub const TCPIP_OWNER_MODULE_BASIC_INFO = ip_helper.TCPIP_OWNER_MODULE_BASIC_INFO;
+pub const TCPIP_OWNER_MODULE_INFO_CLASS = ip_helper.TCPIP_OWNER_MODULE_INFO_CLASS;
+/// The only info class the SDK defines (`TCPIP_OWNER_MODULE_INFO_BASIC`);
+/// upstream names the enumerant `C`.
+pub const TCPIP_OWNER_MODULE_INFO_BASIC = TCPIP_OWNER_MODULE_INFO_CLASS.C;
+
+// ---------------------------------------------------------------------------
+// Service Control Manager (advapi32) — the PID → hosted-services map
+// (Service Attribution tier 1 and the tier 3 fallback list, issue #25)
+// ---------------------------------------------------------------------------
+
+pub const OpenSCManagerW = zigwin32.advapi32.OpenSCManagerW;
+pub const EnumServicesStatusExW = zigwin32.advapi32.EnumServicesStatusExW;
+pub const CloseServiceHandle = zigwin32.advapi32.CloseServiceHandle;
+
+/// `isize` upstream; 0 is the failure value `OpenSCManagerW` returns.
+pub const SC_HANDLE = zigwin32.security.SC_HANDLE;
+pub const NULL_SC_HANDLE: SC_HANDLE = 0;
+pub const ENUM_SERVICE_STATUS_PROCESSW = services.ENUM_SERVICE_STATUS_PROCESSW;
+pub const SERVICE_STATUS_PROCESS = services.SERVICE_STATUS_PROCESS;
+
+pub const SC_MANAGER_CONNECT = services.SC_MANAGER_CONNECT;
+pub const SC_MANAGER_ENUMERATE_SERVICE = services.SC_MANAGER_ENUMERATE_SERVICE;
+pub const SC_ENUM_PROCESS_INFO = services.SC_ENUM_PROCESS_INFO;
+/// Both hosting shapes: own-process services and the shared hosts zPulsar
+/// exists to split. Drivers are excluded — they own no sockets.
+pub const SERVICE_WIN32 = services.SERVICE_WIN32;
+/// Only services that are running (or starting/stopping) have a PID.
+pub const SERVICE_ACTIVE = services.SERVICE_ACTIVE;
+
+// ---------------------------------------------------------------------------
+// Winsock name resolution (ws2_32) — the reverse-lookup lane (issue #26).
+// `GetNameInfoW` is synchronous only; no overlapped address→name call exists
+// (docs/research/dns-client-etw.md §7), which is exactly why it gets a thread
+// of its own.
+// ---------------------------------------------------------------------------
+
+pub const GetNameInfoW = zigwin32.ws2_32.GetNameInfoW;
+pub const WSAGetLastError = zigwin32.ws2_32.WSAGetLastError;
+
+pub const SOCKADDR_IN = win_sock.SOCKADDR_IN;
+pub const SOCKADDR_IN6 = win_sock.SOCKADDR_IN6;
+pub const ADDRESS_FAMILY = win_sock.ADDRESS_FAMILY;
+/// The `WSADATA` the OS writes into. Never read — only its size matters, and
+/// getting that wrong smashes the caller's stack rather than corrupting a read,
+/// so it is asserted below like every other ABI-crossing struct.
+pub const WSADATA = win_sock.WSADATA;
+
+/// winsock2.h result codes the reverse-lookup lane distinguishes: these three
+/// are statements about the *address* (it has no name); everything else is a
+/// statement about the resolver.
+pub const WSA_ERROR = win_sock.WSA_ERROR;
+pub const WSAHOST_NOT_FOUND = win_sock.WSAHOST_NOT_FOUND;
+pub const WSANO_DATA = win_sock.WSANO_DATA;
+pub const WSANO_RECOVERY = win_sock.WSANO_RECOVERY;
+
+/// The last ws2_32 error on this thread, for the call that just failed.
+pub fn wsaLastError() WSA_ERROR {
+    return WSAGetLastError();
+}
+/// `AF_INET`/`AF_INET6` as a sockaddr's `sa_family` field type; the `u32`
+/// spellings above are what the iphlpapi table calls take.
+pub const AF_INET_FAMILY: ADDRESS_FAMILY = win_sock.AF_INET;
+pub const AF_INET6_FAMILY: ADDRESS_FAMILY = win_sock.AF_INET6;
+
+/// ws2tcpip.h flags: fail with `WSAHOST_NOT_FOUND` rather than echo the
+/// address back when no PTR record exists, and skip the service name we never
+/// read. `GetNameInfoW` takes Flags as `i32`; the upstream constants are `u32`.
+pub const NI_NAMEREQD: i32 = @intCast(win_sock.NI_NAMEREQD);
+pub const NI_NUMERICSERV: i32 = @intCast(win_sock.NI_NUMERICSERV);
+
+/// Winsock must be initialized before any ws2_32 call. Failure is not fatal —
+/// it just means no reverse lookups, and flows fall back to bare endpoints.
+pub fn wsaStartup() bool {
+    var data: WSADATA = undefined;
+    // MAKEWORD(2, 2) — the version every supported Windows provides.
+    return zigwin32.ws2_32.WSAStartup(0x0202, &data) == 0;
+}
+
+// ---------------------------------------------------------------------------
 // DOS device mapping (kernel32) — NT device path → drive letter display
 // ---------------------------------------------------------------------------
 
@@ -146,6 +254,17 @@ pub const Sleep = zigwin32.kernel32.Sleep;
 /// Monotonic milliseconds since boot; Zig 0.16 moved std's monotonic clock
 /// behind std.Io, so tick pacing uses the OS directly.
 pub const GetTickCount64 = zigwin32.kernel32.GetTickCount64;
+
+/// Wall clock as a flat FILETIME tick count (100 ns since 1601) — the domain
+/// ETW stamps every event header in, and the one payload CreateTime values
+/// live in. Captured once beside `GetTickCount64` to anchor event time
+/// against the Engine's monotonic clock, and once per SCM enumeration to
+/// bound which process instances that map is entitled to describe.
+pub fn systemTimeAsFileTime() u64 {
+    var ft: foundation.FILETIME = undefined;
+    zigwin32.kernel32.GetSystemTimeAsFileTime(&ft);
+    return (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
 
 pub const GetStdHandle = zigwin32.kernel32.GetStdHandle;
 pub const STD_ERROR_HANDLE = zigwin32.system.console.STD_ERROR_HANDLE;
@@ -309,9 +428,84 @@ comptime {
     assert(@offsetOf(MIB_UDP6TABLE_OWNER_PID, "dwNumEntries") == 0);
     assert(@offsetOf(MIB_UDP6TABLE_OWNER_PID, "table") == 4);
 
+    // tcpmib.h/udpmib.h *_OWNER_MODULE rows. All four end with
+    // ULONGLONG OwningModuleInfo[TCPIP_OWNING_MODULE_SIZE=16] = 128 bytes,
+    // 8-aligned — which is what forces the padding before liCreateTimestamp
+    // in the two v4 rows. The UDP rows' 4-byte flags bitfield sits between
+    // liCreateTimestamp and OwningModuleInfo.
+    assert(@sizeOf(MIB_TCPROW_OWNER_MODULE) == 160);
+    assert(@offsetOf(MIB_TCPROW_OWNER_MODULE, "dwOwningPid") == 20);
+    assert(@offsetOf(MIB_TCPROW_OWNER_MODULE, "liCreateTimestamp") == 24);
+    assert(@offsetOf(MIB_TCPROW_OWNER_MODULE, "OwningModuleInfo") == 32);
+    assert(@sizeOf(MIB_TCP6ROW_OWNER_MODULE) == 192);
+    assert(@offsetOf(MIB_TCP6ROW_OWNER_MODULE, "ucRemoteAddr") == 24);
+    assert(@offsetOf(MIB_TCP6ROW_OWNER_MODULE, "dwState") == 48);
+    assert(@offsetOf(MIB_TCP6ROW_OWNER_MODULE, "dwOwningPid") == 52);
+    assert(@offsetOf(MIB_TCP6ROW_OWNER_MODULE, "liCreateTimestamp") == 56);
+    assert(@offsetOf(MIB_TCP6ROW_OWNER_MODULE, "OwningModuleInfo") == 64);
+    assert(@sizeOf(MIB_UDPROW_OWNER_MODULE) == 160);
+    assert(@offsetOf(MIB_UDPROW_OWNER_MODULE, "dwOwningPid") == 8);
+    assert(@offsetOf(MIB_UDPROW_OWNER_MODULE, "liCreateTimestamp") == 16);
+    assert(@offsetOf(MIB_UDPROW_OWNER_MODULE, "OwningModuleInfo") == 32);
+    assert(@sizeOf(MIB_UDP6ROW_OWNER_MODULE) == 176);
+    assert(@offsetOf(MIB_UDP6ROW_OWNER_MODULE, "dwOwningPid") == 24);
+    assert(@offsetOf(MIB_UDP6ROW_OWNER_MODULE, "liCreateTimestamp") == 32);
+    assert(@offsetOf(MIB_UDP6ROW_OWNER_MODULE, "OwningModuleInfo") == 48);
+    assert(@offsetOf(MIB_TCPTABLE_OWNER_MODULE, "table") == 8);
+    assert(@offsetOf(MIB_TCP6TABLE_OWNER_MODULE, "table") == 8);
+    assert(@offsetOf(MIB_UDPTABLE_OWNER_MODULE, "table") == 8);
+    assert(@offsetOf(MIB_UDP6TABLE_OWNER_MODULE, "table") == 8);
+
+    // iphlpapi.h TCPIP_OWNER_MODULE_BASIC_INFO — two pointers into the
+    // caller's buffer, which is why the buffer must outlive the strings.
+    assert(@sizeOf(TCPIP_OWNER_MODULE_BASIC_INFO) == 16);
+    assert(@offsetOf(TCPIP_OWNER_MODULE_BASIC_INFO, "pModuleName") == 0);
+    assert(@offsetOf(TCPIP_OWNER_MODULE_BASIC_INFO, "pModulePath") == 8);
+    assert(@intFromEnum(TCPIP_OWNER_MODULE_INFO_BASIC) == 0);
+
+    // winsvc.h ENUM_SERVICE_STATUS_PROCESSW / SERVICE_STATUS_PROCESS
+    assert(@sizeOf(SERVICE_STATUS_PROCESS) == 36);
+    assert(@offsetOf(SERVICE_STATUS_PROCESS, "dwCurrentState") == 4);
+    assert(@offsetOf(SERVICE_STATUS_PROCESS, "dwProcessId") == 28);
+    assert(@sizeOf(ENUM_SERVICE_STATUS_PROCESSW) == 56);
+    assert(@offsetOf(ENUM_SERVICE_STATUS_PROCESSW, "lpServiceName") == 0);
+    assert(@offsetOf(ENUM_SERVICE_STATUS_PROCESSW, "lpDisplayName") == 8);
+    assert(@offsetOf(ENUM_SERVICE_STATUS_PROCESSW, "ServiceStatusProcess") == 16);
+    // winsvc.h access rights and the SERVICE_WIN32 type mask (0x30).
+    assert(SC_MANAGER_CONNECT == 0x0001);
+    assert(SC_MANAGER_ENUMERATE_SERVICE == 0x0004);
+    assert(@as(u32, @bitCast(SERVICE_WIN32)) == 0x30);
+    assert(@intFromEnum(SERVICE_ACTIVE) == 1);
+
     // ws2def.h address families
     assert(AF_INET == 2);
     assert(AF_INET6 == 23);
+    assert(@intFromEnum(AF_INET_FAMILY) == AF_INET);
+    assert(@intFromEnum(AF_INET6_FAMILY) == AF_INET6);
+
+    // ws2def.h SOCKADDR_IN / SOCKADDR_IN6 — what GetNameInfoW is handed. The
+    // v4 sockaddr is written through a pointer to the v6 one, so their common
+    // prefix (the family field) must line up as well as their sizes.
+    assert(@sizeOf(ADDRESS_FAMILY) == 2);
+    assert(@sizeOf(SOCKADDR_IN) == 16);
+    assert(@offsetOf(SOCKADDR_IN, "sin_family") == 0);
+    assert(@offsetOf(SOCKADDR_IN, "sin_port") == 2);
+    assert(@offsetOf(SOCKADDR_IN, "sin_addr") == 4);
+    assert(@sizeOf(SOCKADDR_IN6) == 28);
+    assert(@alignOf(SOCKADDR_IN6) >= @alignOf(SOCKADDR_IN));
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_family") == 0);
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_port") == 2);
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_flowinfo") == 4);
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_addr") == 8);
+    assert(@offsetOf(SOCKADDR_IN6, "Anonymous") == 24); // sin6_scope_id
+
+    // winsock2.h WSADATA — an OS-written output buffer, so an undersized
+    // declaration corrupts the caller's stack rather than a read.
+    assert(@sizeOf(WSADATA) == 408);
+
+    // ws2tcpip.h getnameinfo flags
+    assert(NI_NAMEREQD == 0x04);
+    assert(NI_NUMERICSERV == 0x08);
 }
 
 test {

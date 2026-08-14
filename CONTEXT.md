@@ -29,8 +29,12 @@ The fixed window after a Flow closes during which it stays visible, dimmed, in t
 _Avoid_: Grace period, TIME_WAIT (that's TCP's, not ours)
 
 **Eviction**:
-Dropping per-item visibility under a memory cap by rolling an item's totals upward into its parent. Eviction may coarsen attribution; it never loses bytes.
+Dropping per-item visibility under a memory cap by rolling an item's totals upward — a Flow's into its Process Row, an exited Process Row's into the Evicted-processes Row. Eviction may coarsen attribution; it never loses bytes.
 _Avoid_: Dropping, discarding (both imply lost bytes)
+
+**Evicted-processes Row**:
+The single row that evicted exited Process Rows roll their totals into, labelled "(evicted processes)". It owns no PID and no Flows: it is where attribution stops, and the only row that is never itself a candidate for Eviction.
+_Avoid_: Other, misc (both read as a category rather than as a memory bound)
 
 **Process Row**:
 The top-level unit of display and aggregation — a monitored process, or a single service inside a shared service-host process.
