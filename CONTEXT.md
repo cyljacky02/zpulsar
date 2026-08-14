@@ -4,6 +4,14 @@ A lightweight Windows process network monitor: it shows every process's live net
 
 ## Language
 
+**Engine**:
+The UI-independent core of zPulsar: capture, attribution, aggregation, and name/service resolution. It exposes its state only as Snapshots and knows nothing about windows, rendering, or the tray.
+_Avoid_: Backend, service, daemon
+
+**Snapshot**:
+An immutable, self-contained view of the Engine's current state — Process Rows, Flows, rates, In-session Totals — published as a whole; a reader's view never changes underneath it.
+_Avoid_: Frame, state dump
+
 **Flow**:
 A single network conversation attributed to one process, identified by protocol plus local/remote endpoint (for ICMP, by protocol and remote endpoint).
 _Avoid_: Connection (implies TCP only), socket, session
