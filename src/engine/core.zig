@@ -2,15 +2,20 @@
 //! locks). Rows are process instances keyed (PID, payload CreateTime) —
 //! PID reuse yields a fresh row, exited rows persist all session with their
 //! In-session Totals intact, and traffic arriving inside the flush window
-//! after an exit still lands on the exited row (issue #21). The connection
-//! list is reconciled between events and IP Helper snapshots, and the
-//! unified loss recovery — ring overflow and ETW EventsLost both re-baseline
-//! from fresh tables and set the sticky health flag. Totals are honest or
-//! marked, never silently low.
+//! after an exit still lands on the exited row (issue #21). The Flow layer
+//! (flows.zig, issue #22) hangs each row's Flows beneath it: Flows bind to
+//! their owning row instance at open, close into Linger on disconnect,
+//! age-out, sweep, or process exit, and reconcile against IP Helper
+//! snapshots. The unified loss recovery — ring overflow and ETW EventsLost
+//! both re-baseline from fresh tables and set the sticky health flag.
+//! Totals are honest or marked, never silently low. All lifecycle timing
+//! runs on the caller's monotonic `now_ms` so the whole layer is drivable
+//! by synthetic clocks.
 
 const std = @import("std");
 const device_map = @import("device_map.zig");
 const event = @import("event.zig");
+const flows = @import("flows.zig");
 const snapshot = @import("snapshot.zig");
 const tables = @import("tables.zig");
 
@@ -29,6 +34,8 @@ const ProcessRow = struct {
     /// start/rundown payloads only — never by the stop event (its name is
     /// kernel-truncated, research §2.4).
     name: []const u8 = "",
+    /// In-session Totals: independent accumulators — they include bytes of
+    /// Flows that have long left the list.
     sent: u64 = 0,
     recv: u64 = 0,
 };
@@ -43,9 +50,7 @@ pub const Core = struct {
     /// The most recently exited row per PID — where post-exit flush-window
     /// traffic goes.
     exited_by_pid: std.AutoHashMapUnmanaged(u32, u32) = .empty,
-    /// Live connections by normalized key → owning row index. The cold-start
-    /// dedupe seam: seeded rows and event-inserted entries meet here.
-    conns: std.AutoHashMapUnmanaged(event.ConnKey, u32) = .empty,
+    flows: flows.Table = .{},
     /// NT-device → drive-letter display conversion. Populated by the runner
     /// at start; owned (and freed) by Core.
     drive_map: device_map.DriveMap = .{},
@@ -53,6 +58,8 @@ pub const Core = struct {
     seq: u64 = 0,
     /// Publish at least once even before any traffic.
     dirty: bool = true,
+    /// Scratch flow-entry list reused across snapshot builds.
+    flow_scratch: std.ArrayList(flows.Entry) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Core {
         return .{ .gpa = gpa };
@@ -63,13 +70,18 @@ pub const Core = struct {
         self.rows.deinit(self.gpa);
         self.live_by_pid.deinit(self.gpa);
         self.exited_by_pid.deinit(self.gpa);
-        self.conns.deinit(self.gpa);
+        self.flows.deinit(self.gpa);
         self.drive_map.deinit(self.gpa);
+        self.flow_scratch.deinit(self.gpa);
     }
 
     /// Apply one net-event ring record. OOM drops the record — the caller
     /// counts it as ring-equivalent loss.
-    pub fn applyEvent(self: *Core, ev: event.NetEvent) error{OutOfMemory}!void {
+    pub fn applyEvent(
+        self: *Core,
+        ev: event.NetEvent,
+        now_ms: u64,
+    ) error{OutOfMemory}!void {
         switch (ev.op) {
             .send, .recv => {
                 const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
@@ -78,24 +90,30 @@ pub const Core = struct {
                     row.sent += ev.size
                 else
                     row.recv += ev.size;
-                // A connection first seen through data (raced the snapshot,
-                // or newer than it) is inserted from the event.
-                try self.upsertConn(event.connKey(ev), idx);
+                // First activity opens the Flow (raced the table snapshot,
+                // or a new Generation after closure).
+                const live = try self.flows.touch(self.gpa, flows.flowKey(ev), idx, now_ms);
+                if (ev.op == .send) live.sent += ev.size else live.recv += ev.size;
                 self.dirty = true;
             },
             .connect => {
                 const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
-                try self.upsertConn(event.connKey(ev), idx);
+                try self.flows.connect(self.gpa, flows.flowKey(ev), idx, now_ms);
                 self.dirty = true;
             },
             .disconnect => {
-                if (self.conns.remove(event.connKey(ev))) self.dirty = true;
+                if (try self.flows.close(self.gpa, flows.flowKey(ev), now_ms))
+                    self.dirty = true;
             },
         }
     }
 
     /// Apply one Kernel-Process ring record: row identity and lifetime.
-    pub fn applyProcess(self: *Core, ev: event.ProcessEvent) error{OutOfMemory}!void {
+    pub fn applyProcess(
+        self: *Core,
+        ev: event.ProcessEvent,
+        now_ms: u64,
+    ) error{OutOfMemory}!void {
         switch (ev.kind) {
             .start, .rundown => {
                 if (self.live_by_pid.get(ev.pid)) |idx| {
@@ -111,7 +129,7 @@ pub const Core = struct {
                     } else {
                         // A different instance owns the PID and we never saw
                         // its stop: retire it, fresh row for the new one.
-                        try self.retire(idx, 0);
+                        try self.retire(idx, 0, now_ms);
                         try self.nameRow(try self.newRow(ev.pid, ev.create_time), ev);
                     }
                 } else {
@@ -126,7 +144,7 @@ pub const Core = struct {
                         // A placeholder adopts the key from the stop payload
                         // — but never its name (research §2.4).
                         self.rows.items[idx].create_time = ev.create_time;
-                        try self.retire(idx, ev.exit_time);
+                        try self.retire(idx, ev.exit_time, now_ms);
                         self.dirty = true;
                     }
                     // A stop for some other instance of this PID: the row it
@@ -136,7 +154,7 @@ pub const Core = struct {
                     // No row at all (exited before the rundown burst landed):
                     // an exited row keyed from the stop payload keeps any
                     // late traffic attributed. Name stays empty.
-                    try self.retire(try self.newRow(ev.pid, ev.create_time), ev.exit_time);
+                    try self.retire(try self.newRow(ev.pid, ev.create_time), ev.exit_time, now_ms);
                     self.dirty = true;
                 }
                 if (self.exited_by_pid.get(ev.pid)) |prev| {
@@ -169,6 +187,13 @@ pub const Core = struct {
         return self.newRow(pid, 0);
     }
 
+    /// flows.Table asks here for the owning row of a Flow it is about to
+    /// seed — only then, so skipped table rows can't mint ghost placeholder
+    /// rows.
+    pub fn rowForSeed(self: *Core, pid: u32) error{OutOfMemory}!u32 {
+        return self.rowForTraffic(pid, 0);
+    }
+
     /// Append a row and make it the PID's current owner.
     fn newRow(self: *Core, pid: u32, create_time: u64) error{OutOfMemory}!u32 {
         const idx: u32 = @intCast(self.rows.items.len);
@@ -178,13 +203,16 @@ pub const Core = struct {
     }
 
     /// Mark a row exited and stop routing its PID to it (except through
-    /// exited_by_pid, for the flush window).
-    fn retire(self: *Core, idx: u32, exit_time: u64) error{OutOfMemory}!void {
+    /// exited_by_pid, for the flush window). Process exit closes the
+    /// instance's live Flows into normal Linger (spec issue #18 Data model)
+    /// — the issue #22 seam, wired here to the Kernel-Process events.
+    fn retire(self: *Core, idx: u32, exit_time: u64, now_ms: u64) error{OutOfMemory}!void {
         const row = &self.rows.items[idx];
         row.exited = true;
         row.exit_time = exit_time;
         _ = self.live_by_pid.remove(row.pid);
         try self.exited_by_pid.put(self.gpa, row.pid, idx);
+        _ = try self.flows.closeRowFlows(self.gpa, idx, now_ms);
     }
 
     /// Set a row's display name from a start/rundown payload, first writer
@@ -196,24 +224,20 @@ pub const Core = struct {
         self.rows.items[idx].name = try self.drive_map.displayPath(self.gpa, buf[0..n]);
     }
 
-    fn upsertConn(self: *Core, key: event.ConnKey, row_idx: u32) error{OutOfMemory}!void {
-        const gop = try self.conns.getOrPut(self.gpa, key);
-        // Existing entries keep their row — a seeded entry and its event
-        // describe the same owner.
-        if (!gop.found_existing) gop.value_ptr.* = row_idx;
+    /// Time-driven Flow maintenance: Linger expiry and UDP age-outs. Called
+    /// at the Engine's flush-tick cadence.
+    pub fn tick(self: *Core, now_ms: u64) error{OutOfMemory}!void {
+        if (try self.flows.tick(self.gpa, now_ms)) self.dirty = true;
     }
 
-    /// Cold-start seed: insert table rows that no event has claimed yet.
-    /// Events that raced the snapshot already sit in the map under the same
-    /// normalized key — that is the dedupe. Claimed keys are skipped before
-    /// any row lookup, so a table row disagreeing with the event's payload
-    /// PID cannot mint a ghost placeholder row.
-    pub fn seed(self: *Core, rows: []const tables.SeededConn) error{OutOfMemory}!void {
-        for (rows) |r| {
-            if (self.conns.contains(r.key)) continue;
-            try self.conns.put(self.gpa, r.key, try self.rowForTraffic(r.pid, 0));
-            self.dirty = true;
-        }
+    /// Cold-start seed and the 10 s reconciliation sweep share this: align
+    /// the Flow list with a fresh IP Helper table snapshot.
+    pub fn reconcile(
+        self: *Core,
+        rows: []const tables.SeededConn,
+        now_ms: u64,
+    ) error{OutOfMemory}!void {
+        if (try self.flows.reconcile(self.gpa, rows, self, now_ms)) self.dirty = true;
     }
 
     /// Compare cumulative loss counters against the last observed values.
@@ -229,14 +253,14 @@ pub const Core = struct {
         return lost;
     }
 
-    /// Loss recovery: rebuild the connection list from fresh tables. Totals
+    /// Loss recovery: reconcile the Flow list against fresh tables. Totals
     /// stay — the sticky flag marks them as possibly low.
-    pub fn rebaseline(self: *Core, rows: []const tables.SeededConn) error{OutOfMemory}!void {
-        self.conns.clearRetainingCapacity();
-        for (rows) |r| {
-            if (self.conns.contains(r.key)) continue; // duplicate table rows
-            try self.conns.put(self.gpa, r.key, try self.rowForTraffic(r.pid, 0));
-        }
+    pub fn rebaseline(
+        self: *Core,
+        rows: []const tables.SeededConn,
+        now_ms: u64,
+    ) error{OutOfMemory}!void {
+        try self.reconcile(rows, now_ms);
         self.flagRebaselined();
     }
 
@@ -249,11 +273,23 @@ pub const Core = struct {
 
     /// Build an immutable Snapshot of the current state in its own arena:
     /// one row per process instance (live, exited, and placeholders), sorted
-    /// by PID with exited instances before their PID's live successor.
+    /// by PID with exited instances before their PID's live successor, each
+    /// row's Flows grouped under it.
     pub fn buildSnapshot(self: *Core) error{OutOfMemory}!*snapshot.Snapshot {
-        const snap = try snapshot.create(self.gpa, self.rows.items.len);
+        // Flows first, sorted (row, identity, generation): each row's Flows
+        // become one contiguous, deterministically ordered span.
+        self.flow_scratch.clearRetainingCapacity();
+        try self.flows.collect(self.gpa, &self.flow_scratch);
+        std.mem.sort(flows.Entry, self.flow_scratch.items, {}, entryLessThan);
+
+        const snap = try snapshot.create(
+            self.gpa,
+            self.rows.items.len,
+            self.flow_scratch.items.len,
+        );
         errdefer snap.release();
         const out = snapshot.mutableRows(snap);
+        const flat = snapshot.mutableFlows(snap);
 
         for (self.rows.items, out) |row, *dst| {
             dst.* = .{
@@ -264,14 +300,24 @@ pub const Core = struct {
                 .recv = row.recv,
             };
         }
-        // Connection counts address rows by position — count before sorting.
-        var c_it = self.conns.iterator();
-        while (c_it.next()) |entry| {
-            const dst = &out[entry.value_ptr.*];
-            switch (entry.key_ptr.proto) {
-                .tcp => dst.tcp_conns += 1,
-                .udp => dst.udp_socks += 1,
+        // Flows address rows by position — attach spans and count live
+        // flows before sorting (the sorted rows carry their slices along).
+        for (self.flow_scratch.items, 0..) |e, i| flat[i] = e.flow;
+        var fi: usize = 0;
+        while (fi < self.flow_scratch.items.len) {
+            const start = fi;
+            const row_idx = self.flow_scratch.items[fi].row;
+            const dst = &out[row_idx];
+            while (fi < self.flow_scratch.items.len and
+                self.flow_scratch.items[fi].row == row_idx) : (fi += 1)
+            {
+                const f = self.flow_scratch.items[fi].flow;
+                if (!f.lingering) switch (f.proto) {
+                    .tcp => dst.tcp_conns += 1,
+                    .udp => dst.udp_socks += 1,
+                };
             }
+            dst.flows = flat[start..fi];
         }
         std.mem.sort(snapshot.Row, out, {}, rowOrder);
 
@@ -287,6 +333,29 @@ pub const Core = struct {
 fn rowOrder(_: void, a: snapshot.Row, b: snapshot.Row) bool {
     if (a.pid != b.pid) return a.pid < b.pid;
     return a.exited and !b.exited;
+}
+
+/// Sort order for snapshot flows: owning row, then flow identity, then
+/// Generation — stable across builds so the UI never sees flows jump.
+fn entryLessThan(_: void, a: flows.Entry, b: flows.Entry) bool {
+    if (a.row != b.row) return a.row < b.row;
+    const fa = a.flow;
+    const fb = b.flow;
+    if (fa.proto != fb.proto) return @intFromEnum(fa.proto) < @intFromEnum(fb.proto);
+    if (fa.family != fb.family) return @intFromEnum(fa.family) < @intFromEnum(fb.family);
+    if (fa.local_port != fb.local_port) return fa.local_port < fb.local_port;
+    if (fa.remote_port != fb.remote_port) return fa.remote_port < fb.remote_port;
+    switch (std.mem.order(u8, &fa.local_addr, &fb.local_addr)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    switch (std.mem.order(u8, &fa.remote_addr, &fb.remote_addr)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    return fa.generation < fb.generation;
 }
 
 // ---------------------------------------------------------------------------
@@ -349,10 +418,10 @@ fn rowForPid(rows: []const snapshot.Row, pid: u32) ?snapshot.Row {
 test "send and recv accumulate independent u64 totals per payload PID" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
-    try core.applyEvent(testEvent(.send, .tcp, 100, 1500, 1));
-    try core.applyEvent(testEvent(.send, .tcp, 100, 500, 1));
-    try core.applyEvent(testEvent(.recv, .tcp, 100, 42, 1));
-    try core.applyEvent(testEvent(.recv, .udp, 200, 7, 2));
+    try core.applyEvent(testEvent(.send, .tcp, 100, 1500, 1), 0);
+    try core.applyEvent(testEvent(.send, .tcp, 100, 500, 1), 0);
+    try core.applyEvent(testEvent(.recv, .tcp, 100, 42, 1), 0);
+    try core.applyEvent(testEvent(.recv, .udp, 200, 7, 2), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -383,7 +452,7 @@ test "seeded pre-existing connections appear as rows with zero totals" {
             .remote_port = 443,
         },
     }};
-    try core.seed(&seeded);
+    try core.reconcile(&seeded, 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -397,9 +466,9 @@ test "events racing the snapshot dedupe by normalized 5-tuple" {
     defer core.deinit();
     // The buffered event arrives first (drained after session start)...
     const ev = testEvent(.connect, .tcp, 100, 0, 51000);
-    try core.applyEvent(ev);
+    try core.applyEvent(ev, 0);
     // ...then the table snapshot lands carrying the same connection.
-    try core.seed(&.{.{ .pid = 100, .key = event.connKey(ev) }});
+    try core.reconcile(&.{.{ .pid = 100, .key = event.connKey(ev) }}, 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -407,8 +476,8 @@ test "events racing the snapshot dedupe by normalized 5-tuple" {
 
     // Same dedupe for UDP, where the table only knows the local endpoint.
     const udp_data = testEvent(.send, .udp, 300, 10, 5353);
-    try core.applyEvent(udp_data);
-    try core.seed(&.{.{ .pid = 300, .key = event.connKey(udp_data) }});
+    try core.applyEvent(udp_data, 0);
+    try core.reconcile(&.{.{ .pid = 300, .key = event.connKey(udp_data) }}, 0);
     const snap2 = try core.buildSnapshot();
     defer snap2.release();
     try std.testing.expectEqual(@as(u32, 1), rowForPid(snap2.rows, 300).?.udp_socks);
@@ -418,10 +487,10 @@ test "disconnect closes the connection but totals persist" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
     const data = testEvent(.send, .tcp, 100, 999, 51000);
-    try core.applyEvent(data);
+    try core.applyEvent(data, 0);
     var fin = data;
     fin.op = .disconnect;
-    try core.applyEvent(fin);
+    try core.applyEvent(fin, 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -433,8 +502,8 @@ test "disconnect closes the connection but totals persist" {
 test "start and rundown for the same instance dedupe on the row key" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
-    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\ping.exe"));
-    try core.applyProcess(procEvent(.rundown, 100, 111, 0, "\\x\\ping.exe"));
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\ping.exe"), 0);
+    try core.applyProcess(procEvent(.rundown, 100, 111, 0, "\\x\\ping.exe"), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -447,8 +516,8 @@ test "traffic racing the rundown lands on a placeholder the identity adopts" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
     // Cold start: bytes arrive before the CAPTURE_STATE burst.
-    try core.applyEvent(testEvent(.send, .tcp, 100, 5000, 1));
-    try core.applyProcess(procEvent(.rundown, 100, 111, 0, "\\x\\svchost.exe"));
+    try core.applyEvent(testEvent(.send, .tcp, 100, 5000, 1), 0);
+    try core.applyProcess(procEvent(.rundown, 100, 111, 0, "\\x\\svchost.exe"), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -461,9 +530,9 @@ test "traffic racing the rundown lands on a placeholder the identity adopts" {
 test "exit marks the row with totals intact; a reused PID gets a fresh row" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
-    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"));
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 700, 1, 150));
-    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""));
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"), 0);
+    try core.applyEvent(testEventAt(.send, .tcp, 100, 700, 1, 150), 0);
+    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -473,8 +542,8 @@ test "exit marks the row with totals intact; a reused PID gets a fresh row" {
     try std.testing.expectEqualStrings("\\x\\a.exe", snap.rows[0].name);
 
     // The PID comes back as a different process: fresh row, fresh totals.
-    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"));
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 11, 1, 600));
+    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"), 0);
+    try core.applyEvent(testEventAt(.send, .tcp, 100, 11, 1, 600), 0);
     const snap2 = try core.buildSnapshot();
     defer snap2.release();
     try std.testing.expectEqual(@as(usize, 2), snap2.rows.len);
@@ -489,10 +558,10 @@ test "exit marks the row with totals intact; a reused PID gets a fresh row" {
 test "traffic just after exit attributes to the exited row, never a fresh one" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
-    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"));
-    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""));
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"), 0);
+    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""), 0);
     // Flush-window straggler: stamped while the process was alive.
-    try core.applyEvent(testEventAt(.recv, .tcp, 100, 333, 1, 180));
+    try core.applyEvent(testEventAt(.recv, .tcp, 100, 333, 1, 180), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -502,9 +571,9 @@ test "traffic just after exit attributes to the exited row, never a fresh one" {
 
     // Even once the PID is reused, an event stamped before the new
     // instance existed still belongs to the exited row.
-    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"));
-    try core.applyEvent(testEventAt(.recv, .tcp, 100, 44, 1, 190));
-    try core.applyEvent(testEventAt(.recv, .tcp, 100, 55, 1, 600));
+    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"), 0);
+    try core.applyEvent(testEventAt(.recv, .tcp, 100, 44, 1, 190), 0);
+    try core.applyEvent(testEventAt(.recv, .tcp, 100, 55, 1, 600), 0);
     const snap2 = try core.buildSnapshot();
     defer snap2.release();
     try std.testing.expectEqual(@as(u64, 333 + 44), snap2.rows[0].recv);
@@ -517,8 +586,8 @@ test "a stop with no prior identity yields an unnamed exited row that catches la
     // The process exited before the rundown burst could name it. The stop
     // payload's ANSI name never reaches the record (parser contract), so the
     // row stays nameless rather than showing a truncated name.
-    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""));
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 77, 1, 150));
+    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""), 0);
+    try core.applyEvent(testEventAt(.send, .tcp, 100, 77, 1, 150), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -531,11 +600,11 @@ test "a stop with no prior identity yields an unnamed exited row that catches la
 test "a start for an already-owned PID retires the unseen predecessor" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
-    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"));
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 900, 1, 150));
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"), 0);
+    try core.applyEvent(testEventAt(.send, .tcp, 100, 900, 1, 150), 0);
     // The stop was lost; the next instance's start must not merge into a.exe.
-    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"));
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 1, 1, 600));
+    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"), 0);
+    try core.applyEvent(testEventAt(.send, .tcp, 100, 1, 1, 600), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -553,8 +622,8 @@ test "display names are drive-letter converted; bare kernel names pass through" 
     entries[0] = .{ .device = try gpa.dupe(u8, "\\Device\\HarddiskVolume3"), .letter = 'C' };
     core.drive_map = .{ .entries = entries };
 
-    try core.applyProcess(procEvent(.rundown, 100, 111, 0, "\\Device\\HarddiskVolume3\\Windows\\System32\\PING.EXE"));
-    try core.applyProcess(procEvent(.rundown, 4, 1, 0, "System"));
+    try core.applyProcess(procEvent(.rundown, 100, 111, 0, "\\Device\\HarddiskVolume3\\Windows\\System32\\PING.EXE"), 0);
+    try core.applyProcess(procEvent(.rundown, 4, 1, 0, "System"), 0);
 
     const snap = try core.buildSnapshot();
     defer snap.release();
@@ -568,13 +637,13 @@ test "display names are drive-letter converted; bare kernel names pass through" 
 test "loss recovery: both loss sources set the sticky re-baselined flag" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
-    try core.applyEvent(testEvent(.send, .tcp, 100, 1000, 51000));
+    try core.applyEvent(testEvent(.send, .tcp, 100, 1000, 51000), 0);
 
     try std.testing.expect(!core.noteLoss(0, 0)); // quiet: no loss yet
 
     // Ring overflow.
     try std.testing.expect(core.noteLoss(3, 0));
-    try core.rebaseline(&.{}); // fresh tables happen to be empty
+    try core.rebaseline(&.{}, 0); // fresh tables happen to be empty
     const snap = try core.buildSnapshot();
     defer snap.release();
     try std.testing.expect(snap.health.rebaselined);
@@ -592,32 +661,327 @@ test "loss recovery: both loss sources set the sticky re-baselined flag" {
     try std.testing.expectEqual(@as(u64, 5), snap2.health.etw_events_lost);
 }
 
+test "a TCP connect creates a live Flow under its Process Row" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 0);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    const f = row.flows[0];
+    try std.testing.expectEqual(event.Proto.tcp, f.proto);
+    try std.testing.expectEqual(@as(u16, 51000), f.local_port);
+    try std.testing.expectEqual(@as(u16, 443), f.remote_port);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 93, 184, 216, 34 }, f.remote_addr[0..4]);
+    try std.testing.expectEqual(@as(u32, 1), f.generation);
+    try std.testing.expect(!f.lingering);
+    try std.testing.expectEqual(@as(u32, 1), row.tcp_conns);
+    // Hostname/service attribution are later tickets: fields exist, empty.
+    try std.testing.expectEqual(@as(?[]const u8, null), f.remote_hostname);
+    try std.testing.expectEqual(@as(?[]const u8, null), f.service);
+}
+
+test "a closed Flow Lingers 10 s with bytes retained in row totals" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const data = testEvent(.send, .tcp, 100, 999, 51000);
+    try core.applyEvent(data, 1000);
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 2000);
+
+    // Lingering: still visible, dimmed, totals frozen, out of the live count.
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(u32, 0), row.tcp_conns);
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u64, 999), row.flows[0].sent);
+
+    // One millisecond short of the Linger window: still there.
+    try core.tick(11_999);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    try std.testing.expectEqual(@as(usize, 1), rowForPid(snap2.rows, 100).?.flows.len);
+
+    // At the boundary it leaves the flow list; the row keeps its bytes.
+    try core.tick(12_000);
+    const snap3 = try core.buildSnapshot();
+    defer snap3.release();
+    const row3 = rowForPid(snap3.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 0), row3.flows.len);
+    try std.testing.expectEqual(@as(u64, 999), row3.sent);
+}
+
+test "endpoint reuse after closure starts a new Generation with fresh totals" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const data = testEvent(.send, .tcp, 100, 500, 51000);
+    try core.applyEvent(data, 0);
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 1000);
+
+    // Reuse while the old Flow still Lingers: both visible, distinct.
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 2000);
+    try core.applyEvent(testEvent(.send, .tcp, 100, 7, 51000), 2500);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    // Identical identity sorts by Generation: the old Flow first.
+    try std.testing.expectEqual(@as(u32, 1), row.flows[0].generation);
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u64, 500), row.flows[0].sent);
+    try std.testing.expectEqual(@as(u32, 2), row.flows[1].generation);
+    try std.testing.expect(!row.flows[1].lingering);
+    // The old totals are never resumed: the new Generation starts from its
+    // own bytes.
+    try std.testing.expectEqual(@as(u64, 7), row.flows[1].sent);
+    // The Process Row accumulates across Generations.
+    try std.testing.expectEqual(@as(u64, 507), row.sent);
+}
+
+test "a connect on a live Flow that carried bytes closes it into a new Generation" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // Bytes flow, then the disconnect is lost; the endpoints get reused.
+    try core.applyEvent(testEvent(.send, .tcp, 100, 100, 51000), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 5000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u64, 100), row.flows[0].sent);
+    try std.testing.expectEqual(@as(u32, 2), row.flows[1].generation);
+    try std.testing.expectEqual(@as(u64, 0), row.flows[1].sent);
+    try std.testing.expectEqual(@as(u32, 1), row.tcp_conns);
+}
+
+test "a connect on a zero-byte live Flow is the same connection seen twice" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // Cold start: the table seeds the connection, then the buffered connect
+    // event for the same connection drains — one Flow, not a churned pair.
+    const ev = testEvent(.connect, .tcp, 100, 0, 51000);
+    try core.reconcile(&.{.{ .pid = 100, .key = event.connKey(ev) }}, 0);
+    try core.applyEvent(ev, 100);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expectEqual(@as(u32, 1), row.flows[0].generation);
+    try std.testing.expect(!row.flows[0].lingering);
+}
+
+test "one UDP socket talking to two remotes is two Flows" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const a = testEvent(.send, .udp, 300, 10, 5353);
+    var b = a;
+    b.remote_addr = [4]u8{ 8, 8, 8, 8 } ++ @as([12]u8, @splat(0));
+    b.remote_port = 53;
+    try core.applyEvent(a, 0);
+    try core.applyEvent(b, 0);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 300).?;
+    // The Flow key keeps UDP's real remote endpoint (spec issue #18 Data
+    // model) — unlike the local-only table-dedupe key.
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try std.testing.expectEqual(@as(u32, 2), row.udp_socks);
+    try std.testing.expect(row.flows[0].remote_port != row.flows[1].remote_port);
+}
+
+test "UDP Flows age out after 60 s inactivity into normal Linger" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(testEvent(.send, .udp, 300, 10, 5353), 0);
+    // Activity resets the clock.
+    try core.applyEvent(testEvent(.recv, .udp, 300, 4, 5353), 30_000);
+
+    try core.tick(89_999);
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    try std.testing.expect(!rowForPid(snap.rows, 300).?.flows[0].lingering);
+
+    // 60 s after the last activity: closed into normal Linger…
+    try core.tick(90_000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    const row2 = rowForPid(snap2.rows, 300).?;
+    try std.testing.expect(row2.flows[0].lingering);
+    try std.testing.expectEqual(@as(u32, 0), row2.udp_socks);
+
+    // …and 10 s later it leaves, bytes retained in the row.
+    try core.tick(100_000);
+    const snap3 = try core.buildSnapshot();
+    defer snap3.release();
+    const row3 = rowForPid(snap3.rows, 300).?;
+    try std.testing.expectEqual(@as(usize, 0), row3.flows.len);
+    try std.testing.expectEqual(@as(u64, 10), row3.sent);
+    try std.testing.expectEqual(@as(u64, 4), row3.recv);
+}
+
+test "a real conversation replaces a seeded UDP socket's zero-remote placeholder" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // Cold start: the UDP owner table only knows the local endpoint, so the
+    // idle socket appears as a zero-remote placeholder Flow.
+    const ev = testEvent(.send, .udp, 300, 10, 5353);
+    try core.reconcile(&.{.{ .pid = 300, .key = event.connKey(ev) }}, 0);
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const seeded_row = rowForPid(snap.rows, 300).?;
+    try std.testing.expectEqual(@as(usize, 1), seeded_row.flows.len);
+    try std.testing.expectEqual(@as(u16, 0), seeded_row.flows[0].remote_port);
+
+    // Traffic on the socket: the real conversation supersedes the byte-less
+    // placeholder outright — one Flow, not a socket shown twice.
+    try core.applyEvent(ev, 1000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    const row = rowForPid(snap2.rows, 300).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expectEqual(@as(u16, 443), row.flows[0].remote_port);
+    try std.testing.expectEqual(@as(u64, 10), row.flows[0].sent);
+}
+
+test "the reconciliation sweep closes TCP Flows whose close events were lost" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const keep = testEvent(.send, .tcp, 100, 10, 51000);
+    const lost = testEvent(.send, .tcp, 100, 20, 51001);
+    try core.applyEvent(keep, 0);
+    try core.applyEvent(lost, 0);
+
+    // The sweep's fresh table still shows one connection; the other is gone
+    // — its disconnect event never arrived.
+    try core.reconcile(&.{.{ .pid = 100, .key = event.connKey(keep) }}, 5000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try std.testing.expectEqual(@as(u16, 51000), row.flows[0].local_port);
+    try std.testing.expect(!row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u16, 51001), row.flows[1].local_port);
+    try std.testing.expect(row.flows[1].lingering);
+    try std.testing.expectEqual(@as(u32, 1), row.tcp_conns);
+}
+
+test "the sweep keeps a seeded idle UDP socket alive exactly as long as it stays bound" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const ev = testEvent(.send, .udp, 300, 10, 5353);
+    const table_row: tables.SeededConn = .{ .pid = 300, .key = event.connKey(ev) };
+    try core.reconcile(&.{table_row}, 0);
+
+    // Still in the table at 55 s: refreshed past the 60 s age-out.
+    try core.reconcile(&.{table_row}, 55_000);
+    try core.tick(60_000);
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    try std.testing.expect(!rowForPid(snap.rows, 300).?.flows[0].lingering);
+
+    // Socket unbound: the next sweep closes the placeholder into Linger.
+    try core.reconcile(&.{}, 70_000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    try std.testing.expect(rowForPid(snap2.rows, 300).?.flows[0].lingering);
+}
+
+test "a half-closed table row is presence, never a seed" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // An event-closed Flow whose table row lingers in FIN_WAIT/CLOSE_WAIT
+    // (those states can persist for minutes) must not come back as a ghost
+    // zero-byte Generation.
+    const data = testEvent(.send, .tcp, 100, 30, 51000);
+    try core.applyEvent(data, 0);
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 1000);
+    try core.reconcile(&.{.{ .pid = 100, .key = event.connKey(data), .closing = true }}, 5000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u32, 0), row.tcp_conns);
+
+    // But a live Flow whose row went half-closed stays open — data can
+    // still move; the event-driven close will land.
+    const live = testEvent(.send, .tcp, 200, 40, 52000);
+    try core.applyEvent(live, 0);
+    try core.reconcile(&.{.{ .pid = 200, .key = event.connKey(live), .closing = true }}, 5000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    try std.testing.expectEqual(@as(u32, 1), rowForPid(snap2.rows, 200).?.tcp_conns);
+}
+
+test "process exit closes its live Flows into normal Linger" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(testEvent(.send, .tcp, 100, 50, 51000), 0);
+    try core.applyEvent(testEvent(.send, .udp, 100, 5, 5353), 0);
+    try core.applyEvent(testEvent(.send, .tcp, 200, 9, 52000), 0);
+
+    // The Kernel-Process stop event adopts the traffic placeholder and
+    // retires it — closing the instance's live Flows on the way out.
+    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""), 1000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const exited = rowForPid(snap.rows, 100).?;
+    try std.testing.expect(exited.exited);
+    try std.testing.expectEqual(@as(usize, 2), exited.flows.len);
+    try std.testing.expect(exited.flows[0].lingering);
+    try std.testing.expect(exited.flows[1].lingering);
+    try std.testing.expectEqual(@as(u64, 55), exited.sent);
+    try std.testing.expect(!rowForPid(snap.rows, 200).?.flows[0].lingering);
+
+    // Normal Linger: gone at 10 s, the exited row and its totals stay.
+    try core.tick(11_000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    const row2 = rowForPid(snap2.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 0), row2.flows.len);
+    try std.testing.expectEqual(@as(u64, 55), row2.sent);
+}
+
 test "a held Snapshot never changes while the Engine keeps updating" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
     var published: snapshot.Published = try .init();
     defer published.deinit();
 
-    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"));
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 1000, 51000, 150));
+    try core.applyEvent(testEvent(.send, .tcp, 100, 1000, 51000), 0);
     published.publish(try core.buildSnapshot());
     const held = published.acquire().?;
     defer held.release();
 
-    // The Engine moves on: more bytes, an exit, a new PID, loss, a new
-    // Snapshot.
-    try core.applyEvent(testEventAt(.send, .tcp, 100, 5000, 51000, 160));
-    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""));
-    try core.applyEvent(testEvent(.recv, .tcp, 777, 1, 4000));
+    // The Engine moves on: more bytes, a new PID, loss, a new Snapshot.
+    try core.applyEvent(testEvent(.send, .tcp, 100, 5000, 51000), 0);
+    try core.applyEvent(testEvent(.recv, .tcp, 777, 1, 4000), 0);
     _ = core.noteLoss(9, 0);
     core.flagRebaselined();
     published.publish(try core.buildSnapshot());
 
-    // The held reader still sees the old world, bit for bit.
+    // The held reader still sees the old world, bit for bit — its Flows too.
     try std.testing.expectEqual(@as(usize, 1), held.rows.len);
     try std.testing.expectEqual(@as(u64, 1000), held.rows[0].sent);
-    try std.testing.expect(!held.rows[0].exited);
-    try std.testing.expectEqualStrings("\\x\\a.exe", held.rows[0].name);
+    try std.testing.expectEqual(@as(usize, 1), held.rows[0].flows.len);
+    try std.testing.expectEqual(@as(u64, 1000), held.rows[0].flows[0].sent);
     try std.testing.expect(!held.health.rebaselined);
 
     // A fresh reader sees the new one.
@@ -625,6 +989,5 @@ test "a held Snapshot never changes while the Engine keeps updating" {
     defer fresh.release();
     try std.testing.expect(fresh.seq > held.seq);
     try std.testing.expectEqual(@as(u64, 6000), rowForPid(fresh.rows, 100).?.sent);
-    try std.testing.expect(rowForPid(fresh.rows, 100).?.exited);
     try std.testing.expect(fresh.health.rebaselined);
 }

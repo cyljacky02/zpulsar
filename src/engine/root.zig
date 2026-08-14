@@ -9,6 +9,7 @@ pub const core = @import("core.zig");
 pub const device_map = @import("device_map.zig");
 pub const etw_session = @import("etw_session.zig");
 pub const event = @import("event.zig");
+pub const flows = @import("flows.zig");
 pub const parser = @import("parser.zig");
 pub const process_parser = @import("process_parser.zig");
 pub const process_tdh = @import("process_tdh.zig");

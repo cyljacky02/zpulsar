@@ -16,6 +16,11 @@ const event = @import("event.zig");
 pub const SeededConn = struct {
     key: event.ConnKey,
     pid: u32,
+    /// TCP row in a half-closed state (FIN_WAIT/CLOSE_WAIT/…): it still
+    /// counts as presence — data can move and a live Flow must stay open —
+    /// but it seeds nothing, or event-closed Flows whose row outlives them
+    /// (CLOSE_WAIT sits for minutes) would come back as ghost Generations.
+    closing: bool = false,
 };
 
 pub const SnapshotError = error{ OutOfMemory, TableQueryFailed };
@@ -83,11 +88,12 @@ fn getTable(comptime protocol: Protocol, buf: ?*anyopaque, size: *u32, af: u32) 
 }
 
 /// All four OWNER_PID tables share the shape dwNumEntries: u32 followed by
-/// packed rows (comptime-asserted in the facade). Returns false when the
-/// buffer doesn't hold the rows it claims.
+/// packed rows (comptime-asserted in the facade). Rows the converter rejects
+/// (dead-state TCP) are skipped. Returns false when the buffer doesn't hold
+/// the rows it claims.
 fn appendRows(
     comptime Row: type,
-    comptime convert: fn (Row) SeededConn,
+    comptime convert: fn (Row) ?SeededConn,
     list: *std.ArrayList(SeededConn),
     gpa: std.mem.Allocator,
     buf: []align(4) const u8,
@@ -98,8 +104,29 @@ fn appendRows(
     if (rows_bytes.len / @sizeOf(Row) < n) return false;
     const rows = @as([*]const Row, @ptrCast(@alignCast(rows_bytes.ptr)))[0..n];
     try list.ensureUnusedCapacity(gpa, n);
-    for (rows) |row| list.appendAssumeCapacity(convert(row));
+    for (rows) |row| {
+        if (convert(row)) |conn| list.appendAssumeCapacity(conn);
+    }
     return true;
+}
+
+const TcpRowLife = enum { open, closing, dead };
+
+/// How a TCP table state maps into the Flow layer. Dead rows never appear —
+/// a TIME_WAIT remnant outlives its connection by minutes, and seeding it
+/// would revive every event-closed Flow as a ghost on the next sweep.
+/// Half-closed rows are presence without seeding (SeededConn.closing).
+/// Unknown states classify as closing: presence is safe, seeding is not.
+fn tcpRowLife(dw_state: u32) TcpRowLife {
+    const S = win32.MIB_TCP_STATE;
+    if (dw_state == @intFromEnum(S.CLOSED) or
+        dw_state == @intFromEnum(S.TIME_WAIT) or
+        dw_state == @intFromEnum(S.DELETE_TCB)) return .dead;
+    if (dw_state == @intFromEnum(S.LISTEN) or
+        dw_state == @intFromEnum(S.SYN_SENT) or
+        dw_state == @intFromEnum(S.SYN_RCVD) or
+        dw_state == @intFromEnum(S.ESTAB)) return .open;
+    return .closing;
 }
 
 /// The port DWORDs hold the u16 port in network byte order in their low
@@ -115,8 +142,10 @@ fn addr4(dw: u32) [16]u8 {
     return std.mem.toBytes(dw) ++ @as([12]u8, @splat(0));
 }
 
-fn tcp4Conn(row: win32.MIB_TCPROW_OWNER_PID) SeededConn {
-    return .{ .pid = row.dwOwningPid, .key = .{
+fn tcp4Conn(row: win32.MIB_TCPROW_OWNER_PID) ?SeededConn {
+    const life = tcpRowLife(row.dwState);
+    if (life == .dead) return null;
+    return .{ .pid = row.dwOwningPid, .closing = life == .closing, .key = .{
         .proto = .tcp,
         .family = .v4,
         .local_addr = addr4(row.dwLocalAddr),
@@ -126,8 +155,10 @@ fn tcp4Conn(row: win32.MIB_TCPROW_OWNER_PID) SeededConn {
     } };
 }
 
-fn tcp6Conn(row: win32.MIB_TCP6ROW_OWNER_PID) SeededConn {
-    return .{ .pid = row.dwOwningPid, .key = .{
+fn tcp6Conn(row: win32.MIB_TCP6ROW_OWNER_PID) ?SeededConn {
+    const life = tcpRowLife(row.dwState);
+    if (life == .dead) return null;
+    return .{ .pid = row.dwOwningPid, .closing = life == .closing, .key = .{
         .proto = .tcp,
         .family = .v6,
         .local_addr = row.ucLocalAddr,
@@ -139,7 +170,7 @@ fn tcp6Conn(row: win32.MIB_TCP6ROW_OWNER_PID) SeededConn {
 
 /// UDP rows are local-endpoint only; the zeroed remote side is exactly the
 /// event-side UDP key normalization (event.connKey).
-fn udp4Conn(row: win32.MIB_UDPROW_OWNER_PID) SeededConn {
+fn udp4Conn(row: win32.MIB_UDPROW_OWNER_PID) ?SeededConn {
     return .{ .pid = row.dwOwningPid, .key = .{
         .proto = .udp,
         .family = .v4,
@@ -150,7 +181,7 @@ fn udp4Conn(row: win32.MIB_UDPROW_OWNER_PID) SeededConn {
     } };
 }
 
-fn udp6Conn(row: win32.MIB_UDP6ROW_OWNER_PID) SeededConn {
+fn udp6Conn(row: win32.MIB_UDP6ROW_OWNER_PID) ?SeededConn {
     return .{ .pid = row.dwOwningPid, .key = .{
         .proto = .udp,
         .family = .v6,
@@ -271,6 +302,41 @@ test "udp rows seed local-only keys matching the event-side normalization" {
         .timestamp_ft = 0,
     });
     try std.testing.expectEqual(from_event, c.key);
+}
+
+test "dead-state TCP rows never become seeded connections" {
+    // TIME_WAIT (and CLOSED/DELETE_TCB) remnants outlive the connection by
+    // minutes; seeding them would revive every event-closed Flow as a ghost
+    // on the next reconciliation sweep.
+    const template = win32.MIB_TCPROW_OWNER_PID{
+        .dwState = 0,
+        .dwLocalAddr = std.mem.bytesToValue(u32, &[4]u8{ 192, 168, 1, 2 }),
+        .dwLocalPort = testPortDword(51000),
+        .dwRemoteAddr = std.mem.bytesToValue(u32, &[4]u8{ 93, 184, 216, 34 }),
+        .dwRemotePort = testPortDword(443),
+        .dwOwningPid = 4242,
+    };
+    var closed = template;
+    closed.dwState = @intFromEnum(win32.MIB_TCP_STATE.CLOSED);
+    var established = template;
+    established.dwState = @intFromEnum(win32.MIB_TCP_STATE.ESTAB);
+    var time_wait = template;
+    time_wait.dwState = @intFromEnum(win32.MIB_TCP_STATE.TIME_WAIT);
+    var delete_tcb = template;
+    delete_tcb.dwState = @intFromEnum(win32.MIB_TCP_STATE.DELETE_TCB);
+    var fin_wait2 = template;
+    fin_wait2.dwState = @intFromEnum(win32.MIB_TCP_STATE.FIN_WAIT2);
+
+    const rows = [_]win32.MIB_TCPROW_OWNER_PID{ closed, established, time_wait, delete_tcb, fin_wait2 };
+    const buf = try testTableBuffer(win32.MIB_TCPROW_OWNER_PID, std.testing.allocator, &rows);
+    defer std.testing.allocator.free(buf);
+
+    var list: std.ArrayList(SeededConn) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try std.testing.expect(try appendRows(win32.MIB_TCPROW_OWNER_PID, tcp4Conn, &list, std.testing.allocator, buf));
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expect(!list.items[0].closing); // ESTABLISHED seeds
+    try std.testing.expect(list.items[1].closing); // FIN_WAIT2 is presence only
 }
 
 test "a buffer that doesn't hold the rows it claims is rejected" {
