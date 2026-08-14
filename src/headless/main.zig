@@ -1,12 +1,10 @@
-//! Debug-only headless target (ADR-0002): runs the Engine without any UI,
-//! proving the module boundary and doubling as the test/perf rig. For this
-//! walking skeleton it brings the `zPulsarNet` session up, enables
-//! Kernel-Network, prints the cold-start TCP/UDP table row counts, and stops
-//! the session on every exit path. Requires elevation.
+//! Debug-only headless target (ADR-0002): the full hot path with no UI —
+//! issue #20's tracer. Brings the `zPulsarNet` session up, runs the consumer
+//! and Engine threads, and renders a live per-PID In-session Totals table
+//! from acquired Snapshots, health flags included. Requires elevation.
 //!
-//! Usage: zpulsar-headless [--hold <seconds>]
-//! `--hold` keeps the session up (e.g. to exercise the console-ctrl path);
-//! default is to exit immediately after the snapshot.
+//! Usage: zpulsar-headless [--duration <seconds>]
+//! Default runs until Ctrl+C.
 
 const std = @import("std");
 const engine = @import("engine");
@@ -19,7 +17,7 @@ const win32 = @import("win32");
 fn consoleCtrlHandler(ctrl_type: u32) callconv(.winapi) win32.BOOL {
     _ = ctrl_type;
     const stopped = engine.etw_session.stopByName();
-    std.debug.print("console-ctrl: session {s}\n", .{if (stopped) "stopped" else "already gone"});
+    std.debug.print("\nconsole-ctrl: session {s}\n", .{if (stopped) "stopped" else "already gone"});
     return win32.FALSE;
 }
 
@@ -29,7 +27,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (win32.SetConsoleCtrlHandler(consoleCtrlHandler, win32.TRUE) == win32.FALSE)
         std.debug.print("warning: SetConsoleCtrlHandler failed; console-ctrl will leak the session\n", .{});
 
-    const hold_seconds = try parseHoldArg(gpa, init.args);
+    const duration_s = try parseDurationArg(gpa, init.args);
 
     const logical_cpus: u32 = @intCast(std.Thread.getCpuCount() catch 1);
     const session = engine.etw_session.start(logical_cpus) catch |err| {
@@ -49,50 +47,160 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         std.process.exit(1);
     };
-    defer {
+    if (session.adopted_orphan)
+        std.debug.print("orphaned {s} session found: stopped by name, startup retried\n", .{engine.etw_session.session_name});
+
+    // Fail-fast (ADR-0002): if the hot path cannot come up, stop the session
+    // and exit — never a silently empty tracer.
+    const eng = engine.runner.Engine.start(gpa, session) catch |err| {
+        std.debug.print("error: engine start failed: {t}\n", .{err});
         session.stop();
+        std.debug.print("{s} session stopped\n", .{engine.etw_session.session_name});
+        std.process.exit(1);
+    };
+    // Full ordered shutdown: CloseTrace → ControlTrace(STOP) — never
+    // skipped — → join both threads.
+    defer {
+        eng.stop();
         std.debug.print("{s} session stopped\n", .{engine.etw_session.session_name});
     }
 
-    if (session.adopted_orphan)
-        std.debug.print("orphaned {s} session found: stopped by name, startup retried\n", .{engine.etw_session.session_name});
     std.debug.print(
-        "{s} session started: QPC clock, real-time, 16 KB buffers, {d}/{d} min/max buffers, 1 s FlushTimer\n",
-        .{ engine.etw_session.session_name, 2 * logical_cpus, 4 * logical_cpus },
+        "{s} up: consumer in ProcessTrace, Engine ticking every {d} ms, cold-start seeded\n",
+        .{ engine.etw_session.session_name, engine.runner.flush_interval_ms },
     );
-    std.debug.print("Kernel-Network enabled (keywords IPv4|IPv6)\n", .{});
+    if (duration_s > 0)
+        std.debug.print("running for {d}s (Ctrl+C stops earlier)...\n", .{duration_s})
+    else
+        std.debug.print("running until Ctrl+C...\n", .{});
+    win32.Sleep(1500); // leave the banner readable before the table takes over
 
-    const counts = engine.tables.snapshotTableCounts(gpa) catch {
-        std.debug.print("error: TCP/UDP table snapshot failed\n", .{});
-        // The deferred stop still runs; exit through the error path.
-        return error.SnapshotFailed;
-    };
-    std.debug.print(
-        "cold-start table rows: TCPv4={d} TCPv6={d} UDPv4={d} UDPv6={d}\n",
-        .{ counts.tcp4, counts.tcp6, counts.udp4, counts.udp6 },
-    );
-
-    if (hold_seconds > 0) {
-        std.debug.print("holding session for {d}s (Ctrl+C stops it early)...\n", .{hold_seconds});
-        // Saturate instead of trapping: an absurd --hold must not panic past
-        // the deferred stop. 0xFFFFFFFF would be INFINITE, hence the -1.
-        const hold_ms = hold_seconds *| @as(u64, std.time.ms_per_s);
-        win32.Sleep(std.math.cast(u32, hold_ms) orelse std.math.maxInt(u32) - 1);
+    const vt = enableVtProcessing();
+    const t0 = win32.GetTickCount64();
+    var last_render_ms: u64 = 0;
+    while (true) {
+        // New-Snapshot wake, with a timeout so health/uptime stay fresh.
+        _ = eng.snapshotWake().timedWait(500);
+        const now_ms = win32.GetTickCount64() - t0;
+        // Rendering is the rig's visibility surface: the throttle must stay
+        // well inside the 200 ms attribution budget (delivery ≤ ~120 ms +
+        // publish ≤ 50 ms leaves ~30 ms; trickle renders are immediate).
+        if (now_ms - last_render_ms >= 100) {
+            last_render_ms = now_ms;
+            if (eng.acquireSnapshot()) |snap| {
+                defer snap.release();
+                render(snap, vt, now_ms);
+            }
+        }
+        // Saturate: an absurd --duration must not overflow past the shutdown.
+        if (duration_s > 0 and now_ms >= duration_s *| std.time.ms_per_s) break;
     }
 }
 
-fn parseHoldArg(gpa: std.mem.Allocator, args: std.process.Args) !u64 {
+/// The live table: one repaint built into a fixed buffer, one write. With VT
+/// processing it repaints in place; without it, it scrolls.
+fn render(snap: *engine.snapshot.Snapshot, vt: bool, uptime_ms: u64) void {
+    var out_buf: [32 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out_buf);
+    writeTable(&w, snap, vt, uptime_ms) catch {}; // truncated repaint still prints
+    std.debug.print("{s}", .{w.buffered()});
+}
+
+fn writeTable(
+    w: *std.Io.Writer,
+    snap: *engine.snapshot.Snapshot,
+    vt: bool,
+    uptime_ms: u64,
+) !void {
+    if (vt) try w.writeAll("\x1b[H\x1b[J");
+    try w.print(
+        "zPulsar headless — per-PID In-session Totals  (snapshot #{d}, up {d}s)\n",
+        .{ snap.seq, uptime_ms / 1000 },
+    );
+    try w.print("ring dropped: {d}   etw lost: {d}", .{
+        snap.health.ring_dropped,
+        snap.health.etw_events_lost,
+    });
+    if (snap.health.rebaselined)
+        try w.writeAll("   [RE-BASELINED: loss occurred, totals may undercount]");
+    try w.writeAll("\n\n");
+    try w.print("{s:>8}  {s:>4}  {s:>4}  {s:>12}  {s:>12}\n", .{ "PID", "TCP", "UDP", "SENT", "RECV" });
+
+    // Busiest first; the Snapshot itself stays untouched (it is immutable —
+    // sort a copy; on allocation failure fall back to PID order).
+    const heap = std.heap.page_allocator;
+    const sorted: ?[]engine.snapshot.Row = heap.dupe(engine.snapshot.Row, snap.rows) catch null;
+    defer if (sorted) |s| heap.free(s);
+    const rows: []const engine.snapshot.Row = if (sorted) |s| blk: {
+        std.mem.sort(engine.snapshot.Row, s, {}, rowBusierThan);
+        break :blk s;
+    } else snap.rows;
+    const shown = @min(rows.len, max_rows);
+
+    var total_sent: u64 = 0;
+    var total_recv: u64 = 0;
+    for (snap.rows) |r| {
+        total_sent += r.sent;
+        total_recv += r.recv;
+    }
+
+    var sent_buf: [16]u8 = undefined;
+    var recv_buf: [16]u8 = undefined;
+    for (rows[0..shown]) |r| {
+        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}\n", .{
+            r.pid,
+            r.tcp_conns,
+            r.udp_socks,
+            fmtBytes(r.sent, &sent_buf),
+            fmtBytes(r.recv, &recv_buf),
+        });
+    }
+    if (snap.rows.len > shown)
+        try w.print("  … {d} more processes\n", .{snap.rows.len - shown});
+    try w.print("\n{d} processes   total sent {s}   recv {s}\n", .{
+        snap.rows.len,
+        fmtBytes(total_sent, &sent_buf),
+        fmtBytes(total_recv, &recv_buf),
+    });
+}
+
+const max_rows = 25;
+
+fn rowBusierThan(_: void, a: engine.snapshot.Row, b: engine.snapshot.Row) bool {
+    return a.sent + a.recv > b.sent + b.recv;
+}
+
+/// Decimal units per the spec's display rules (B/KB/MB/GB).
+fn fmtBytes(v: u64, buf: []u8) []const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var val: f64 = @floatFromInt(v);
+    var unit: usize = 0;
+    while (val >= 1000 and unit + 1 < units.len) : (unit += 1) val /= 1000;
+    return if (unit == 0)
+        std.fmt.bufPrint(buf, "{d} B", .{v}) catch "?"
+    else
+        std.fmt.bufPrint(buf, "{d:.1} {s}", .{ val, units[unit] }) catch "?";
+}
+
+fn enableVtProcessing() bool {
+    const handle = win32.GetStdHandle(win32.STD_ERROR_HANDLE);
+    const mode = win32.getConsoleMode(handle) orelse return false;
+    if (mode & win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0) return true;
+    return win32.setConsoleMode(handle, mode | win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+
+fn parseDurationArg(gpa: std.mem.Allocator, args: std.process.Args) !u64 {
     var it = try std.process.Args.Iterator.initAllocator(args, gpa);
     defer it.deinit();
     _ = it.skip(); // exe name
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--hold")) {
+        if (std.mem.eql(u8, arg, "--duration")) {
             const value = it.next() orelse {
-                std.debug.print("error: --hold needs a seconds argument\n", .{});
+                std.debug.print("error: --duration needs a seconds argument\n", .{});
                 std.process.exit(2);
             };
             return std.fmt.parseInt(u64, value, 10) catch {
-                std.debug.print("error: --hold: '{s}' is not a number of seconds\n", .{value});
+                std.debug.print("error: --duration: '{s}' is not a number of seconds\n", .{value});
                 std.process.exit(2);
             };
         }
