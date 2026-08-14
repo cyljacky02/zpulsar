@@ -13,8 +13,20 @@ An immutable, self-contained view of the Engine's current state — Process Rows
 _Avoid_: Frame, state dump
 
 **Flow**:
-A single network conversation attributed to one process, identified by protocol plus local/remote endpoint (for ICMP, by protocol and remote endpoint).
+A single network conversation attributed to one process, identified by protocol, owning process, and local/remote endpoint (for ICMP, by protocol, owning process, and remote endpoint). Endpoint reuse after closure starts a new Flow — see Generation.
 _Avoid_: Connection (implies TCP only), socket, session
+
+**Generation**:
+What distinguishes successive Flows that reuse the same endpoints: a connect, or first activity after closure, starts a new Generation — never resuming the old Flow or its totals.
+_Avoid_: Resurrection, reuse (ambiguous with port reuse)
+
+**Linger**:
+The fixed window after a Flow closes during which it stays visible, dimmed, in the flow list before being removed. Its bytes remain in its Process Row's totals.
+_Avoid_: Grace period, TIME_WAIT (that's TCP's, not ours)
+
+**Eviction**:
+Dropping per-item visibility under a memory cap by rolling an item's totals upward into its parent. Eviction may coarsen attribution; it never loses bytes.
+_Avoid_: Dropping, discarding (both imply lost bytes)
 
 **Process Row**:
 The top-level unit of display and aggregation — a monitored process, or a single service inside a shared service-host process.
