@@ -39,13 +39,25 @@ pub fn snapshotConnections(gpa: std.mem.Allocator) SnapshotError![]SeededConn {
 
 const Protocol = enum { tcp, udp };
 
+/// Which of the four extended tables to fetch, and in which shape. The
+/// OWNER_PID classes seed the Flow list here; the OWNER_MODULE ones carry the
+/// per-socket ownership Service Attribution resolves (owner_module.zig).
+pub const TableClass = union(enum) {
+    tcp: win32.TCP_TABLE_CLASS,
+    udp: win32.UDP_TABLE_CLASS,
+};
+
 fn appendTable(
     list: *std.ArrayList(SeededConn),
     gpa: std.mem.Allocator,
     comptime protocol: Protocol,
     af: u32,
 ) SnapshotError!void {
-    const buf = try fetchTable(gpa, protocol, af);
+    const class: TableClass = switch (protocol) {
+        .tcp => .{ .tcp = .OWNER_PID_ALL },
+        .udp => .{ .udp = .OWNER_PID },
+    };
+    const buf = try fetchExtended(gpa, class, af);
     defer gpa.free(buf);
     const ok = switch (protocol) {
         .tcp => switch (af) {
@@ -61,29 +73,31 @@ fn appendTable(
 }
 
 /// Probe-then-fill; retried because the table can grow between the size
-/// probe and the fill call.
-fn fetchTable(
+/// probe and the fill call. Buffers are 8-aligned for every class — the
+/// OWNER_MODULE rows contain u64s, and over-aligning the OWNER_PID ones costs
+/// nothing. Caller owns the buffer.
+pub fn fetchExtended(
     gpa: std.mem.Allocator,
-    comptime protocol: Protocol,
+    class: TableClass,
     af: u32,
-) SnapshotError![]align(4) u8 {
+) SnapshotError![]align(8) u8 {
     var size: u32 = 0;
-    var rc = getTable(protocol, null, &size, af);
+    var rc = getTable(class, null, &size, af);
     var attempts: u8 = 0;
     while (rc == win32.ERROR_INSUFFICIENT_BUFFER and attempts < 4) : (attempts += 1) {
-        const buf = try gpa.alignedAlloc(u8, .of(u32), size);
+        const buf = try gpa.alignedAlloc(u8, .of(u64), size);
         errdefer gpa.free(buf);
-        rc = getTable(protocol, buf.ptr, &size, af);
+        rc = getTable(class, buf.ptr, &size, af);
         if (rc == win32.ERROR_SUCCESS) return buf;
         gpa.free(buf);
     }
     return error.TableQueryFailed;
 }
 
-fn getTable(comptime protocol: Protocol, buf: ?*anyopaque, size: *u32, af: u32) u32 {
-    return switch (protocol) {
-        .tcp => win32.GetExtendedTcpTable(buf, size, win32.FALSE, af, .OWNER_PID_ALL, 0),
-        .udp => win32.GetExtendedUdpTable(buf, size, win32.FALSE, af, .OWNER_PID, 0),
+fn getTable(class: TableClass, buf: ?*anyopaque, size: *u32, af: u32) u32 {
+    return switch (class) {
+        .tcp => |c| win32.GetExtendedTcpTable(buf, size, win32.FALSE, af, c, 0),
+        .udp => |c| win32.GetExtendedUdpTable(buf, size, win32.FALSE, af, c, 0),
     };
 }
 
@@ -96,7 +110,7 @@ fn appendRows(
     comptime convert: fn (Row) ?SeededConn,
     list: *std.ArrayList(SeededConn),
     gpa: std.mem.Allocator,
-    buf: []align(4) const u8,
+    buf: []align(8) const u8,
 ) error{OutOfMemory}!bool {
     if (buf.len < 4) return false;
     const n = std.mem.readInt(u32, buf[0..4], .little);
@@ -132,13 +146,14 @@ fn tcpRowLife(dw_state: u32) TcpRowLife {
 /// The port DWORDs hold the u16 port in network byte order in their low
 /// bytes ("in network byte order"; upper bytes may be uninitialized —
 /// MIB_TCPROW_OWNER_PID docs), i.e. the classic ntohs((u_short)dwPort).
-fn portFromDword(dw: u32) u16 {
+/// Shared with owner_module.zig: every extended table encodes ports this way.
+pub fn portFromDword(dw: u32) u16 {
     return std.mem.bigToNative(u16, @truncate(dw));
 }
 
 /// The address DWORD is the in_addr value: its memory bytes are already
 /// network order.
-fn addr4(dw: u32) [16]u8 {
+pub fn addr4(dw: u32) [16]u8 {
     return std.mem.toBytes(dw) ++ @as([12]u8, @splat(0));
 }
 
@@ -201,8 +216,8 @@ fn testPortDword(port: u16) u32 {
     return @as(u32, std.mem.nativeToBig(u16, port));
 }
 
-fn testTableBuffer(comptime Row: type, gpa: std.mem.Allocator, rows: []const Row) ![]align(4) u8 {
-    const buf = try gpa.alignedAlloc(u8, .of(u32), 4 + rows.len * @sizeOf(Row));
+fn testTableBuffer(comptime Row: type, gpa: std.mem.Allocator, rows: []const Row) ![]align(8) u8 {
+    const buf = try gpa.alignedAlloc(u8, .of(u64), 4 + rows.len * @sizeOf(Row));
     std.mem.writeInt(u32, buf[0..4], @intCast(rows.len), .little);
     @memcpy(buf[4..], std.mem.sliceAsBytes(rows));
     return buf;
@@ -340,7 +355,7 @@ test "dead-state TCP rows never become seeded connections" {
 }
 
 test "a buffer that doesn't hold the rows it claims is rejected" {
-    var buf: [4 + @sizeOf(win32.MIB_UDPROW_OWNER_PID)]u8 align(4) = @splat(0);
+    var buf: [4 + @sizeOf(win32.MIB_UDPROW_OWNER_PID)]u8 align(8) = @splat(0);
     std.mem.writeInt(u32, buf[0..4], 5, .little); // claims 5 rows, holds 1
     var list: std.ArrayList(SeededConn) = .empty;
     defer list.deinit(std.testing.allocator);
@@ -348,7 +363,7 @@ test "a buffer that doesn't hold the rows it claims is rejected" {
 }
 
 test "an empty table parses to no connections" {
-    var buf: [4]u8 align(4) = @splat(0);
+    var buf: [4]u8 align(8) = @splat(0);
     var list: std.ArrayList(SeededConn) = .empty;
     defer list.deinit(std.testing.allocator);
     try std.testing.expect(try appendRows(win32.MIB_TCPROW_OWNER_PID, tcp4Conn, &list, std.testing.allocator, &buf));

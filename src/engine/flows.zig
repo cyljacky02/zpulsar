@@ -37,7 +37,19 @@ pub fn flowKey(ev: event.NetEvent) FlowKey {
     } };
 }
 
-const Live = struct {
+/// How far Service Attribution (issue #25) has got with a Flow. The Flow
+/// layer only stores this; which tier applies is core.zig's decision.
+pub const Resolution = enum {
+    /// No service map has covered the owning process instance yet.
+    unclassified,
+    /// A per-socket owner-module lookup is in flight on the resolver lane.
+    pending,
+    /// Nothing more will be asked: the answer landed, failed, or was never
+    /// needed (the map alone settles single-service and non-service hosts).
+    settled,
+};
+
+pub const Live = struct {
     generation: u32,
     /// Owning Process Row instance (core.zig row index), bound at open —
     /// a Flow never migrates between Process Rows.
@@ -45,6 +57,10 @@ const Live = struct {
     sent: u64 = 0,
     recv: u64 = 0,
     last_activity_ms: u64,
+    resolution: Resolution = .unclassified,
+    /// The service that owns this socket, resolved per-socket (tier 2).
+    /// Interned by core.zig, so it outlives every service map.
+    service: ?[]const u8 = null,
 };
 
 /// One key's history: the current live Flow (if any), how many closed
@@ -64,6 +80,9 @@ const Lingering = struct {
     sent: u64,
     recv: u64,
     expires_at_ms: u64,
+    /// Carried over from the live Flow: a closed Flow keeps its label for the
+    /// window it stays visible, and a late answer can still land on it.
+    service: ?[]const u8 = null,
 };
 
 fn isZeroRemote(tuple: event.ConnKey) bool {
@@ -151,13 +170,13 @@ pub const Table = struct {
         key: FlowKey,
         row: u32,
         now_ms: u64,
-    ) error{OutOfMemory}!void {
+    ) error{OutOfMemory}!*Live {
         if (self.slots.getPtr(key)) |slot| {
             if (slot.live) |l| {
                 if (l.sent + l.recv > 0) _ = try self.close(gpa, key, now_ms);
             }
         }
-        _ = try self.touch(gpa, key, row, now_ms);
+        return self.touch(gpa, key, row, now_ms);
     }
 
     /// A real per-remote conversation supersedes the socket's table-seeded
@@ -201,6 +220,7 @@ pub const Table = struct {
             .sent = l.sent,
             .recv = l.recv,
             .expires_at_ms = now_ms + linger_ms,
+            .service = l.service,
         });
         slot.live = null;
         slot.linger_count += 1;
@@ -347,6 +367,57 @@ pub const Table = struct {
         return changed;
     }
 
+    /// Apply a per-socket resolution to one Generation. What the module name
+    /// denotes is core.zig's call — it holds the service map — so this asks
+    /// `ctx.serviceNamed(row, module)` once the owning row is known, then
+    /// stores whatever comes back (null = no service could be named).
+    ///
+    /// The Flow stops asking either way: the answer is as good as it gets,
+    /// and a failed lookup leaves the honest fallback standing rather than
+    /// retrying against a table row that is already gone. False when the Flow
+    /// no longer exists — which is how an answer nobody can see anymore is
+    /// dropped.
+    pub fn applyOwnerModule(
+        self: *Table,
+        key: FlowKey,
+        generation: u32,
+        module: ?[]const u8,
+        ctx: anytype,
+    ) bool {
+        const slot = self.slots.getPtr(key) orelse return false;
+        if (slot.live) |*l| {
+            if (l.generation == generation) {
+                l.service = if (module) |m| ctx.serviceNamed(l.row, m) else null;
+                l.resolution = .settled;
+                return true;
+            }
+        }
+        // Closed while the lookup was in flight: it still shows for its
+        // Linger window, so the label is still worth having.
+        if (slot.linger_count == 0) return false;
+        for (self.linger.items[self.linger_head..]) |*l| {
+            if (l.generation == generation and std.meta.eql(l.key, key)) {
+                l.service = if (module) |m| ctx.serviceNamed(l.row, m) else null;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Hand every live Flow still awaiting its Service Attribution tier
+    /// decision to `ctx.classify(key, live)`. Run when a fresh service map
+    /// lands: a Flow that opened before any map could describe its process
+    /// gets its decision then.
+    pub fn eachUnclassified(self: *Table, ctx: anytype) void {
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.live) |*l| {
+                if (l.resolution != .unclassified) continue;
+                ctx.classify(e.key_ptr.*, l);
+            }
+        }
+    }
+
     /// Every visible Flow — live and Lingering — with its owning row index.
     pub fn collect(
         self: *const Table,
@@ -358,11 +429,13 @@ pub const Table = struct {
         while (it.next()) |e| {
             const l = e.value_ptr.live orelse continue;
             out.appendAssumeCapacity(
-                entry(e.key_ptr.*, l.generation, l.row, l.sent, l.recv, false),
+                entry(e.key_ptr.*, l.generation, l.row, l.sent, l.recv, false, l.service),
             );
         }
         for (self.linger.items[self.linger_head..]) |l| {
-            out.appendAssumeCapacity(entry(l.key, l.generation, l.row, l.sent, l.recv, true));
+            out.appendAssumeCapacity(
+                entry(l.key, l.generation, l.row, l.sent, l.recv, true, l.service),
+            );
         }
     }
 
@@ -373,6 +446,7 @@ pub const Table = struct {
         sent: u64,
         recv: u64,
         lingering: bool,
+        service: ?[]const u8,
     ) Entry {
         return .{ .row = row, .flow = .{
             .proto = key.tuple.proto,
@@ -385,6 +459,7 @@ pub const Table = struct {
             .sent = sent,
             .recv = recv,
             .lingering = lingering,
+            .service = service,
         } };
     }
 };

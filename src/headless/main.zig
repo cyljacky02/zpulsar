@@ -1,9 +1,12 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
-//! issue #20's tracer plus issue #21's Process Rows and issue #22's Flows.
-//! Brings the `zPulsarNet` session up, runs the consumer and Engine threads,
-//! and renders a live per-process In-session Totals table from acquired
-//! Snapshots — real image names, dimmed "(exited)" rows, each row's Flows
-//! beneath it with Lingering ones dimmed, health flags. Requires elevation.
+//! issue #20's tracer, issue #21's Process Rows, issue #22's Flows, and
+//! issue #25's Service Attribution. Brings the `zPulsarNet` session up, runs
+//! the consumer, Engine and resolver threads, and renders a live per-process
+//! In-session Totals table from acquired Snapshots — real image names, dimmed
+//! "(exited)" rows, each row's Flows beneath it with Lingering ones dimmed,
+//! the service a row hosts (or the "(N services)" fallback with its list, and
+//! each Flow's own service inside a shared host), health flags. Requires
+//! elevation.
 //!
 //! Usage: zpulsar-headless [--duration <seconds>]
 //! Default runs until Ctrl+C.
@@ -119,9 +122,10 @@ fn writeTable(
         "zPulsar headless — per-process In-session Totals  (snapshot #{d}, up {d}s)\n",
         .{ snap.seq, uptime_ms / 1000 },
     );
-    try w.print("ring dropped: {d}   etw lost: {d}", .{
+    try w.print("ring dropped: {d}   etw lost: {d}   svc lookups dropped: {d}", .{
         snap.health.ring_dropped,
         snap.health.etw_events_lost,
+        snap.health.service_lookups_dropped,
     });
     if (snap.health.rebaselined)
         try w.writeAll("   [RE-BASELINED: loss occurred, totals may undercount]");
@@ -148,9 +152,10 @@ fn writeTable(
 
     var sent_buf: [16]u8 = undefined;
     var recv_buf: [16]u8 = undefined;
+    var service_buf: [256]u8 = undefined;
     for (rows[0..shown]) |r| {
         if (r.exited and vt) try w.writeAll("\x1b[2m");
-        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s}{s}{s}", .{
+        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s}{s}{s}{s}", .{
             r.pid,
             r.tcp_conns,
             r.udp_socks,
@@ -159,11 +164,12 @@ fn writeTable(
             if (r.name.len > max_name_display) "…" else "",
             displayName(r.name),
             if (r.exited) " (exited)" else "",
+            serviceLabel(r, &service_buf),
         });
         if (r.exited and vt) try w.writeAll("\x1b[22m");
         try w.writeAll("\n");
         const flows_shown = @min(r.flows.len, max_flows_per_row);
-        for (r.flows[0..flows_shown]) |f| try writeFlow(w, f, vt);
+        for (r.flows[0..flows_shown]) |f| try writeFlow(w, f, r, vt);
         if (r.flows.len > flows_shown)
             try w.print("           … {d} more flows\n", .{r.flows.len - flows_shown});
     }
@@ -185,14 +191,20 @@ const max_flows_per_row = 3;
 
 /// One Flow line beneath its row; Lingering flows render dimmed (VT) and
 /// tagged, matching the spec's dimmed Linger display.
-fn writeFlow(w: *std.Io.Writer, f: engine.snapshot.Flow, vt: bool) !void {
+fn writeFlow(
+    w: *std.Io.Writer,
+    f: engine.snapshot.Flow,
+    row: engine.snapshot.Row,
+    vt: bool,
+) !void {
     var lbuf: [64]u8 = undefined;
     var rbuf: [64]u8 = undefined;
     var sbuf: [16]u8 = undefined;
     var rvbuf: [16]u8 = undefined;
+    var svcbuf: [64]u8 = undefined;
     const dim = vt and f.lingering;
     if (dim) try w.writeAll("\x1b[2m");
-    try w.print("           {s} gen{d}  {s} -> {s}  {s} / {s}{s}\n", .{
+    try w.print("           {s} gen{d}  {s} -> {s}  {s} / {s}{s}{s}\n", .{
         @tagName(f.proto),
         f.generation,
         fmtEndpoint(f.family, f.local_addr, f.local_port, &lbuf),
@@ -200,8 +212,40 @@ fn writeFlow(w: *std.Io.Writer, f: engine.snapshot.Flow, vt: bool) !void {
         fmtBytes(f.sent, &sbuf),
         fmtBytes(f.recv, &rvbuf),
         if (f.lingering) "  [linger]" else "",
+        flowServiceLabel(f, row, &svcbuf),
     });
     if (dim) try w.writeAll("\x1b[22m");
+}
+
+/// The Process Row's Service Attribution (spec issue #18, UI: "Process
+/// (badge + name + Service Attribution + flow count)"). One hosted service
+/// means the row *is* that service; several mean a shared host, and the
+/// honest fallback names the count with the actual list — never a guess.
+fn serviceLabel(r: engine.snapshot.Row, buf: []u8) []const u8 {
+    if (r.services.len == 0) return "";
+    if (r.services.len == 1)
+        return std.fmt.bufPrint(buf, "  [{s}]", .{r.services[0]}) catch "";
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("  ({d} services: ", .{r.services.len}) catch return "";
+    for (r.services, 0..) |name, i| {
+        if (i > 0) w.writeAll(", ") catch break;
+        w.writeAll(name) catch break;
+    }
+    w.writeByte(')') catch {};
+    return w.buffered();
+}
+
+/// A Flow's own service. Only shared hosts need it: a single-service row
+/// already names its service once, on the row line. "?" is a Flow still
+/// living under the row's fallback label — resolution pending, or failed.
+fn flowServiceLabel(
+    f: engine.snapshot.Flow,
+    row: engine.snapshot.Row,
+    buf: []u8,
+) []const u8 {
+    if (row.services.len < 2) return "";
+    const name = f.service orelse return "  svc=?";
+    return std.fmt.bufPrint(buf, "  svc={s}", .{name}) catch "";
 }
 
 /// "*" for the zero remote of a placeholder (bound socket, no observed
