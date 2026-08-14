@@ -7,12 +7,12 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const hostnames = @import("hostnames.zig");
 const sync = @import("sync.zig");
 
 /// One Flow as published: identity, Generation, totals, whether it is riding
-/// out its Linger window (dimmed in the UI), and its Service Attribution.
-/// Hostname Attribution is a later ticket — that field is part of the v1
-/// shape but stays unpopulated here.
+/// out its Linger window (dimmed in the UI), its remote name, and its Service
+/// Attribution.
 pub const Flow = struct {
     proto: event.Proto,
     family: event.Family,
@@ -27,9 +27,23 @@ pub const Flow = struct {
     generation: u32,
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Precomputed speed in bytes per second: the 1 s sliding window over
+    /// this Flow's event-time rate ring (rates.zig). Readers display it as
+    /// published — a Snapshot never asks the Engine to compute anything.
+    sent_rate: u64 = 0,
+    recv_rate: u64 = 0,
     /// Closed but still visible, dimmed (CONTEXT.md "Linger").
     lingering: bool = false,
+    /// The name resolved once at Flow creation and stored (CONTEXT.md
+    /// "Hostname Attribution"); null shows the bare endpoint. Arena-owned by
+    /// this Snapshot.
     remote_hostname: ?[]const u8 = null,
+    /// The CNAME chain's tail behind `remote_hostname`, when the answer had
+    /// one — the name the address actually belongs to.
+    remote_alias: ?[]const u8 = null,
+    /// Which tier produced `remote_hostname`. Only `observed` is the name the
+    /// process actually resolved; hints render dimmed with their own marker.
+    hostname_origin: hostnames.Origin = .observed,
     /// The Windows service that owns this Flow (issue #25): its Process Row's
     /// only service, or the one resolved per-socket inside a shared host.
     /// Null means no service could honestly be named — the UI falls back to
@@ -49,8 +63,17 @@ pub const Row = struct {
     name: []const u8 = "",
     /// Dimmed "(exited)" in the UI; totals stay intact.
     exited: bool = false,
+    /// The single "(evicted processes)" row: the exited rows that hit the
+    /// memory cap rolled their totals in here (CONTEXT.md "Eviction" —
+    /// attribution coarsens, bytes do not move). It owns no Flows and no PID.
+    evicted_processes: bool = false,
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Precomputed speed in bytes per second: the 1 s sliding window over
+    /// this Row's own event-time rate ring — the Row is bucketed alongside
+    /// its Flows, so this survives their Linger and their eviction.
+    sent_rate: u64 = 0,
+    recv_rate: u64 = 0,
     /// Live (non-Lingering) flow counts by protocol.
     tcp_conns: u32 = 0,
     udp_socks: u32 = 0,

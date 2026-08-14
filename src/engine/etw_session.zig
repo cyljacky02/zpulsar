@@ -53,6 +53,16 @@ pub const kernel_network_keyword_ipv6: u64 = 0x20;
 pub const kernel_process_guid = win32.Guid.initString("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716");
 pub const kernel_process_keyword_process: u64 = 0x10;
 
+/// Microsoft-Windows-DNS-Client manifest provider
+/// (docs/research/dns-client-etw.md §1). All keywords: that is the
+/// configuration the research traced live, and it is what the 3000-series
+/// events were observed under. The whole provider is ~11 events/s on an idle
+/// desktop, so the consumer filters to event 3008 rather than the session —
+/// kernel-side event-id filtering would buy nothing at that volume and costs
+/// an `ENABLE_TRACE_PARAMETERS` surface to get wrong.
+pub const dns_client_guid = win32.Guid.initString("1c95126e-7eea-49a9-a3fe-a378b03ddb4d");
+pub const dns_client_keyword_any: u64 = std.math.maxInt(u64);
+
 pub const StartError = error{
     /// The controlling APIs require elevation; startup is fail-fast (ADR-0002).
     AccessDenied,
@@ -161,6 +171,7 @@ fn startWith(comptime Ops: type, logical_cpus: u32) StartError!Session {
             .keywords = kernel_network_keyword_ipv4 | kernel_network_keyword_ipv6,
         },
         .{ .guid = &kernel_process_guid, .keywords = kernel_process_keyword_process },
+        .{ .guid = &dns_client_guid, .keywords = dns_client_keyword_any },
     };
     for (enables) |e| {
         if (Ops.enableProvider(handle, e.guid, e.keywords) != .NO_ERROR) {
@@ -223,7 +234,7 @@ const Win32Ops = struct {
 };
 
 const TestOps = struct {
-    const Call = enum { start, stop_by_name, enable_network, enable_process };
+    const Call = enum { start, stop_by_name, enable_network, enable_process, enable_dns };
 
     var calls_buf: [8]Call = undefined;
     var calls_len: usize = 0;
@@ -231,9 +242,11 @@ const TestOps = struct {
     var stop_rc: win32.WIN32_ERROR = .NO_ERROR;
     var enable_network_rc: win32.WIN32_ERROR = .NO_ERROR;
     var enable_process_rc: win32.WIN32_ERROR = .NO_ERROR;
+    var enable_dns_rc: win32.WIN32_ERROR = .NO_ERROR;
     var starts_seen: usize = 0;
     var network_keywords: u64 = 0;
     var process_keywords: u64 = 0;
+    var dns_keywords: u64 = 0;
 
     fn record(call: Call) void {
         calls_buf[calls_len] = call;
@@ -250,9 +263,11 @@ const TestOps = struct {
         stop_rc = .NO_ERROR;
         enable_network_rc = .NO_ERROR;
         enable_process_rc = .NO_ERROR;
+        enable_dns_rc = .NO_ERROR;
         starts_seen = 0;
         network_keywords = 0;
         process_keywords = 0;
+        dns_keywords = 0;
     }
 
     fn startTrace(
@@ -290,25 +305,31 @@ const TestOps = struct {
             network_keywords = any_keywords;
             return enable_network_rc;
         }
-        std.debug.assert(std.mem.eql(u8, &provider.Bytes, &kernel_process_guid.Bytes));
-        record(.enable_process);
-        process_keywords = any_keywords;
-        return enable_process_rc;
+        if (std.mem.eql(u8, &provider.Bytes, &kernel_process_guid.Bytes)) {
+            record(.enable_process);
+            process_keywords = any_keywords;
+            return enable_process_rc;
+        }
+        std.debug.assert(std.mem.eql(u8, &provider.Bytes, &dns_client_guid.Bytes));
+        record(.enable_dns);
+        dns_keywords = any_keywords;
+        return enable_dns_rc;
     }
 };
 
-test "clean start enables Kernel-Network (IPv4|IPv6) and Kernel-Process (0x10)" {
+test "clean start enables Kernel-Network (IPv4|IPv6), Kernel-Process (0x10) and DNS-Client" {
     TestOps.reset(&.{.NO_ERROR});
     const session = try startWith(TestOps, 4);
     try std.testing.expectEqual(@as(win32.CONTROLTRACE_HANDLE, 42), session.handle);
     try std.testing.expect(!session.adopted_orphan);
     try std.testing.expectEqualSlices(
         TestOps.Call,
-        &.{ .start, .enable_network, .enable_process },
+        &.{ .start, .enable_network, .enable_process, .enable_dns },
         TestOps.callsSeen(),
     );
     try std.testing.expectEqual(@as(u64, 0x10 | 0x20), TestOps.network_keywords);
     try std.testing.expectEqual(@as(u64, 0x10), TestOps.process_keywords);
+    try std.testing.expectEqual(std.math.maxInt(u64), TestOps.dns_keywords);
 }
 
 test "already-exists: orphan stopped by name, then start retried" {
@@ -317,7 +338,7 @@ test "already-exists: orphan stopped by name, then start retried" {
     try std.testing.expect(session.adopted_orphan);
     try std.testing.expectEqualSlices(
         TestOps.Call,
-        &.{ .start, .stop_by_name, .start, .enable_network, .enable_process },
+        &.{ .start, .stop_by_name, .start, .enable_network, .enable_process, .enable_dns },
         TestOps.callsSeen(),
     );
 }
@@ -343,13 +364,24 @@ test "enable failure stops the just-started session" {
     );
 }
 
-test "a failing second enable also stops the session — never a half-enabled tracer" {
+test "a failing later enable also stops the session — never a half-enabled tracer" {
     TestOps.reset(&.{.NO_ERROR});
     TestOps.enable_process_rc = .ERROR_ACCESS_DENIED;
     try std.testing.expectError(error.EnableFailed, startWith(TestOps, 4));
     try std.testing.expectEqualSlices(
         TestOps.Call,
         &.{ .start, .enable_network, .enable_process, .stop_by_name },
+        TestOps.callsSeen(),
+    );
+
+    // Including the last one: a tracer with no hostname observation would be
+    // silently degraded rather than fail-fast (ADR-0002).
+    TestOps.reset(&.{.NO_ERROR});
+    TestOps.enable_dns_rc = .ERROR_ACCESS_DENIED;
+    try std.testing.expectError(error.EnableFailed, startWith(TestOps, 4));
+    try std.testing.expectEqualSlices(
+        TestOps.Call,
+        &.{ .start, .enable_network, .enable_process, .enable_dns, .stop_by_name },
         TestOps.callsSeen(),
     );
 }

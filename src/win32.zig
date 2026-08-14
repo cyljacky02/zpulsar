@@ -36,17 +36,6 @@ pub const GetLastError = zigwin32.kernel32.GetLastError;
 /// The SCM enumeration's "buffer too small, resume where you stopped" signal.
 pub const ERROR_MORE_DATA: WIN32_ERROR = .ERROR_MORE_DATA;
 
-pub const FILETIME = foundation.FILETIME;
-pub const GetSystemTimeAsFileTime = zigwin32.kernel32.GetSystemTimeAsFileTime;
-
-/// Wall clock as the flat u64 FILETIME the Engine compares against payload
-/// CreateTime values (both are 100 ns ticks since 1601 UTC).
-pub fn systemTimeAsFileTime() u64 {
-    var ft: FILETIME = undefined;
-    GetSystemTimeAsFileTime(&ft);
-    return @as(u64, ft.dwHighDateTime) << 32 | ft.dwLowDateTime;
-}
-
 // ---------------------------------------------------------------------------
 // ETW session control (advapi32)
 // ---------------------------------------------------------------------------
@@ -200,6 +189,55 @@ pub const SERVICE_WIN32 = services.SERVICE_WIN32;
 pub const SERVICE_ACTIVE = services.SERVICE_ACTIVE;
 
 // ---------------------------------------------------------------------------
+// Winsock name resolution (ws2_32) — the reverse-lookup lane (issue #26).
+// `GetNameInfoW` is synchronous only; no overlapped address→name call exists
+// (docs/research/dns-client-etw.md §7), which is exactly why it gets a thread
+// of its own.
+// ---------------------------------------------------------------------------
+
+pub const GetNameInfoW = zigwin32.ws2_32.GetNameInfoW;
+pub const WSAGetLastError = zigwin32.ws2_32.WSAGetLastError;
+
+pub const SOCKADDR_IN = win_sock.SOCKADDR_IN;
+pub const SOCKADDR_IN6 = win_sock.SOCKADDR_IN6;
+pub const ADDRESS_FAMILY = win_sock.ADDRESS_FAMILY;
+/// The `WSADATA` the OS writes into. Never read — only its size matters, and
+/// getting that wrong smashes the caller's stack rather than corrupting a read,
+/// so it is asserted below like every other ABI-crossing struct.
+pub const WSADATA = win_sock.WSADATA;
+
+/// winsock2.h result codes the reverse-lookup lane distinguishes: these three
+/// are statements about the *address* (it has no name); everything else is a
+/// statement about the resolver.
+pub const WSA_ERROR = win_sock.WSA_ERROR;
+pub const WSAHOST_NOT_FOUND = win_sock.WSAHOST_NOT_FOUND;
+pub const WSANO_DATA = win_sock.WSANO_DATA;
+pub const WSANO_RECOVERY = win_sock.WSANO_RECOVERY;
+
+/// The last ws2_32 error on this thread, for the call that just failed.
+pub fn wsaLastError() WSA_ERROR {
+    return WSAGetLastError();
+}
+/// `AF_INET`/`AF_INET6` as a sockaddr's `sa_family` field type; the `u32`
+/// spellings above are what the iphlpapi table calls take.
+pub const AF_INET_FAMILY: ADDRESS_FAMILY = win_sock.AF_INET;
+pub const AF_INET6_FAMILY: ADDRESS_FAMILY = win_sock.AF_INET6;
+
+/// ws2tcpip.h flags: fail with `WSAHOST_NOT_FOUND` rather than echo the
+/// address back when no PTR record exists, and skip the service name we never
+/// read. `GetNameInfoW` takes Flags as `i32`; the upstream constants are `u32`.
+pub const NI_NAMEREQD: i32 = @intCast(win_sock.NI_NAMEREQD);
+pub const NI_NUMERICSERV: i32 = @intCast(win_sock.NI_NUMERICSERV);
+
+/// Winsock must be initialized before any ws2_32 call. Failure is not fatal —
+/// it just means no reverse lookups, and flows fall back to bare endpoints.
+pub fn wsaStartup() bool {
+    var data: WSADATA = undefined;
+    // MAKEWORD(2, 2) — the version every supported Windows provides.
+    return zigwin32.ws2_32.WSAStartup(0x0202, &data) == 0;
+}
+
+// ---------------------------------------------------------------------------
 // DOS device mapping (kernel32) — NT device path → drive letter display
 // ---------------------------------------------------------------------------
 
@@ -216,6 +254,17 @@ pub const Sleep = zigwin32.kernel32.Sleep;
 /// Monotonic milliseconds since boot; Zig 0.16 moved std's monotonic clock
 /// behind std.Io, so tick pacing uses the OS directly.
 pub const GetTickCount64 = zigwin32.kernel32.GetTickCount64;
+
+/// Wall clock as a flat FILETIME tick count (100 ns since 1601) — the domain
+/// ETW stamps every event header in, and the one payload CreateTime values
+/// live in. Captured once beside `GetTickCount64` to anchor event time
+/// against the Engine's monotonic clock, and once per SCM enumeration to
+/// bound which process instances that map is entitled to describe.
+pub fn systemTimeAsFileTime() u64 {
+    var ft: foundation.FILETIME = undefined;
+    zigwin32.kernel32.GetSystemTimeAsFileTime(&ft);
+    return (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
 
 pub const GetStdHandle = zigwin32.kernel32.GetStdHandle;
 pub const STD_ERROR_HANDLE = zigwin32.system.console.STD_ERROR_HANDLE;
@@ -431,6 +480,32 @@ comptime {
     // ws2def.h address families
     assert(AF_INET == 2);
     assert(AF_INET6 == 23);
+    assert(@intFromEnum(AF_INET_FAMILY) == AF_INET);
+    assert(@intFromEnum(AF_INET6_FAMILY) == AF_INET6);
+
+    // ws2def.h SOCKADDR_IN / SOCKADDR_IN6 — what GetNameInfoW is handed. The
+    // v4 sockaddr is written through a pointer to the v6 one, so their common
+    // prefix (the family field) must line up as well as their sizes.
+    assert(@sizeOf(ADDRESS_FAMILY) == 2);
+    assert(@sizeOf(SOCKADDR_IN) == 16);
+    assert(@offsetOf(SOCKADDR_IN, "sin_family") == 0);
+    assert(@offsetOf(SOCKADDR_IN, "sin_port") == 2);
+    assert(@offsetOf(SOCKADDR_IN, "sin_addr") == 4);
+    assert(@sizeOf(SOCKADDR_IN6) == 28);
+    assert(@alignOf(SOCKADDR_IN6) >= @alignOf(SOCKADDR_IN));
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_family") == 0);
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_port") == 2);
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_flowinfo") == 4);
+    assert(@offsetOf(SOCKADDR_IN6, "sin6_addr") == 8);
+    assert(@offsetOf(SOCKADDR_IN6, "Anonymous") == 24); // sin6_scope_id
+
+    // winsock2.h WSADATA — an OS-written output buffer, so an undersized
+    // declaration corrupts the caller's stack rather than a read.
+    assert(@sizeOf(WSADATA) == 408);
+
+    // ws2tcpip.h getnameinfo flags
+    assert(NI_NAMEREQD == 0x04);
+    assert(NI_NUMERICSERV == 0x08);
 }
 
 test {
