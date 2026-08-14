@@ -6,11 +6,14 @@
 //! to its owning Process Row instance (core.zig row index) when it opens and
 //! never migrates. Closed Flows Linger 10 s and then leave the list; their
 //! bytes live on in the Process Row totals, which are independent
-//! accumulators (core.zig), never a sum of visible flows.
+//! accumulators (core.zig), never a sum of visible flows. That independence
+//! is what makes the Flow cap (issue #23) safe: this table holds visibility,
+//! not accounting, so evicting from it can cost detail but never bytes.
 
 const std = @import("std");
 const event = @import("event.zig");
 const hostnames = @import("hostnames.zig");
+const rates = @import("rates.zig");
 const snapshot = @import("snapshot.zig");
 const tables = @import("tables.zig");
 
@@ -18,6 +21,12 @@ const tables = @import("tables.zig");
 pub const linger_ms: u64 = 10_000;
 /// UDP Flows age out after this much inactivity — no lifecycle events exist.
 pub const udp_idle_ms: u64 = 60_000;
+/// The Flow cap (spec issue #18 Data model, "Memory bounds"): at most this
+/// many visible Flows. Well past any real machine's connection count, so the
+/// cap is a bound on pathology, not a working limit.
+pub const cap: usize = 16 * 1024;
+/// An owning Process Row that Core evicted, in a `remapRows` table.
+pub const removed_row: u32 = std.math.maxInt(u32);
 
 /// Flow identity (spec: protocol, local endpoint, remote endpoint, owning
 /// PID). Unlike the table-dedupe ConnKey, UDP keeps its real remote endpoint:
@@ -78,6 +87,8 @@ const Live = struct {
     row: u32,
     sent: u64 = 0,
     recv: u64 = 0,
+    /// Event-time byte history behind this Flow's displayed speed.
+    rate: rates.Ring = .{},
     last_activity_ms: u64,
     /// When the Flow opened — what the reverse-lookup grace is measured from.
     opened_ms: u64,
@@ -93,17 +104,16 @@ const Slot = struct {
     linger_count: u32 = 0,
 };
 
-/// A closed Flow riding out its Linger window. Totals are frozen at close;
-/// the name is not — a Lingering Flow is still on screen, so a late
-/// observation still upgrades it.
+/// A closed Flow riding out its Linger window: the Flow exactly as it stood
+/// at close, frozen. Its rate ring is frozen with it, so the last bytes it
+/// moved still show as speed and then decay to zero on their own. Holding
+/// the whole `Live` rather than a copy of its fields means a Flow only ever
+/// grows a field in one place — the name included, which is why a late
+/// observation can still upgrade a Lingering Flow: it is still on screen.
 const Lingering = struct {
     key: FlowKey,
-    generation: u32,
-    row: u32,
-    sent: u64,
-    recv: u64,
+    flow: Live,
     expires_at_ms: u64,
-    name: FlowName,
 };
 
 /// The remote endpoint a Flow's name is keyed on. Normalized, because a
@@ -137,6 +147,16 @@ pub const Entry = struct {
     flow: snapshot.Flow,
 };
 
+/// Eviction ordering for live Flows: least recently active first.
+const Idle = struct {
+    key: FlowKey,
+    last_activity_ms: u64,
+};
+
+fn idleFirst(_: void, a: Idle, b: Idle) bool {
+    return a.last_activity_ms < b.last_activity_ms;
+}
+
 pub const Table = struct {
     slots: std.AutoHashMapUnmanaged(FlowKey, Slot) = .empty,
     /// Closed Flows in close order — monotonic time makes this expiry order.
@@ -153,8 +173,8 @@ pub const Table = struct {
         while (it.next()) |e| {
             if (e.value_ptr.live) |*l| l.name.deinit(gpa);
         }
-        // Entries before `linger_head` were already released as they expired.
-        for (self.linger.items[self.linger_head..]) |*l| l.name.deinit(gpa);
+        // Entries before `linger_head` were already released as they retired.
+        for (self.linger.items[self.linger_head..]) |*l| l.flow.name.deinit(gpa);
         self.slots.deinit(gpa);
         self.linger.deinit(gpa);
         self.scratch_tuples.deinit(gpa);
@@ -274,16 +294,12 @@ pub const Table = struct {
     ) error{OutOfMemory}!bool {
         const slot = self.slots.getPtr(key) orelse return false;
         const l = slot.live orelse return false;
-        // The name moves across rather than being copied — the live Flow is
+        // The whole Flow moves across, name included — the live one is
         // dropped in the same breath, so ownership transfers exactly once.
         try self.linger.append(gpa, .{
             .key = key,
-            .generation = l.generation,
-            .row = l.row,
-            .sent = l.sent,
-            .recv = l.recv,
+            .flow = l,
             .expires_at_ms = now_ms + linger_ms,
-            .name = l.name,
         });
         slot.live = null;
         slot.linger_count += 1;
@@ -301,15 +317,9 @@ pub const Table = struct {
     ) error{OutOfMemory}!bool {
         var changed = false;
         while (self.linger_head < self.linger.items.len) {
-            const l = self.linger.items[self.linger_head];
-            if (l.expires_at_ms > now_ms) break;
-            self.linger.items[self.linger_head].name.deinit(gpa);
-            self.linger_head += 1;
+            if (self.linger.items[self.linger_head].expires_at_ms > now_ms) break;
+            self.retireOldestLingering(gpa);
             changed = true;
-            const slot = self.slots.getPtr(l.key).?;
-            slot.linger_count -= 1;
-            if (slot.linger_count == 0 and slot.live == null)
-                _ = self.slots.remove(l.key);
         }
         self.compactLinger();
 
@@ -325,6 +335,63 @@ pub const Table = struct {
             }
         }
         return changed;
+    }
+
+    /// Enforce the Flow cap (CONTEXT.md "Eviction"). Closed Flows go first,
+    /// oldest-first: their bytes already live in their Process Row's totals,
+    /// so dropping them costs visibility only. If live Flows alone still
+    /// exceed the cap, the longest-idle ones go — the key leaves the table
+    /// entirely, so the next activity on it opens a fresh Generation with
+    /// its own totals rather than resuming what the Row already holds.
+    /// Bytes are never at stake here: no accounting lives in this table.
+    pub fn evict(self: *Table, gpa: std.mem.Allocator) error{OutOfMemory}!bool {
+        if (self.count() <= cap) return false;
+
+        // Closed Flows, in close order.
+        while (self.count() > cap and self.linger_head < self.linger.items.len)
+            self.retireOldestLingering(gpa);
+        self.compactLinger();
+        if (self.live_count <= cap) return true;
+
+        // Live Flows, longest idle first. The allocation comes before any
+        // live Flow is touched, so an OOM here costs nothing already done —
+        // the closed Flows above stay evicted, the next tick retries.
+        var idle: std.ArrayList(Idle) = .empty;
+        defer idle.deinit(gpa);
+        try idle.ensureTotalCapacity(gpa, self.live_count);
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            const l = e.value_ptr.live orelse continue;
+            idle.appendAssumeCapacity(.{
+                .key = e.key_ptr.*,
+                .last_activity_ms = l.last_activity_ms,
+            });
+        }
+        std.mem.sort(Idle, idle.items, {}, idleFirst);
+        const excess = self.live_count - cap;
+        for (idle.items[0..excess]) |victim| {
+            const slot = self.slots.getPtr(victim.key).?;
+            // The Flow leaves the table outright, so its name goes with it —
+            // the next Generation on this key resolves its own.
+            slot.live.?.name.deinit(gpa);
+            slot.live = null;
+            self.live_count -= 1;
+            if (slot.linger_count == 0) _ = self.slots.remove(victim.key);
+        }
+        return true;
+    }
+
+    /// Drop the Linger queue's head — whether its window ended or the cap
+    /// came for it — and retire the slot behind it if nothing else there is
+    /// still visible. Caller must not be iterating `slots`.
+    fn retireOldestLingering(self: *Table, gpa: std.mem.Allocator) void {
+        const l = self.linger.items[self.linger_head];
+        self.linger.items[self.linger_head].flow.name.deinit(gpa);
+        self.linger_head += 1;
+        const slot = self.slots.getPtr(l.key).?;
+        slot.linger_count -= 1;
+        if (slot.linger_count == 0 and slot.live == null)
+            _ = self.slots.remove(l.key);
     }
 
     /// The queue only ever grows at the tail; reclaim the dead prefix once
@@ -412,6 +479,64 @@ pub const Table = struct {
         return changed;
     }
 
+    /// Core evicted Process Rows and renumbered the survivors (`map[old]` is
+    /// the new index, or `removed_row`): drop every Flow whose owning row is
+    /// gone — its bytes went up into the Evicted-processes Row with its
+    /// owner — and repoint the rest. Allocation happens before any of it is
+    /// applied, so a failure leaves the table untouched.
+    pub fn remapRows(
+        self: *Table,
+        gpa: std.mem.Allocator,
+        map: []const u32,
+    ) error{OutOfMemory}!void {
+        var dead: std.ArrayList(FlowKey) = .empty;
+        defer dead.deinit(gpa);
+        try dead.ensureTotalCapacity(gpa, self.slots.count());
+
+        // The Linger queue, filtered and compacted to the front. Close order
+        // — and so expiry order — is preserved by the in-place walk.
+        var w: usize = 0;
+        for (self.linger.items[self.linger_head..]) |l| {
+            const to = map[l.flow.row];
+            if (to == removed_row) {
+                // The Flow goes with its owner; its name goes with the Flow.
+                var name = l.flow.name;
+                name.deinit(gpa);
+                continue;
+            }
+            self.linger.items[w] = l;
+            self.linger.items[w].flow.row = to;
+            w += 1;
+        }
+        self.linger.shrinkRetainingCapacity(w);
+        self.linger_head = 0;
+
+        // Live Flows, and the per-slot Linger counts the filtered queue now
+        // implies.
+        var it = self.slots.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.linger_count = 0;
+            if (e.value_ptr.live) |*l| {
+                const to = map[l.row];
+                if (to == removed_row) {
+                    l.name.deinit(gpa);
+                    e.value_ptr.live = null;
+                    self.live_count -= 1;
+                } else l.row = to;
+            }
+        }
+        for (self.linger.items) |l| self.slots.getPtr(l.key).?.linger_count += 1;
+
+        // Slots with nothing visible left leave the map (collected first —
+        // removing mid-iteration is not this map's contract).
+        var empty = self.slots.iterator();
+        while (empty.next()) |e| {
+            if (e.value_ptr.live == null and e.value_ptr.linger_count == 0)
+                dead.appendAssumeCapacity(e.key_ptr.*);
+        }
+        for (dead.items) |key| _ = self.slots.remove(key);
+    }
+
     /// A Process Row instance retired: close its live Flows into normal
     /// Linger (spec issue #18 Data model "process exit closes its live
     /// Flows immediately into normal Linger").
@@ -458,7 +583,7 @@ pub const Table = struct {
         }
         for (self.linger.items[self.linger_head..]) |*l| {
             if (!namesAddress(l.key.tuple, ip)) continue;
-            changed = try upgrade(gpa, &l.name, name) or changed;
+            changed = try upgrade(gpa, &l.flow.name, name) or changed;
         }
         return changed;
     }
@@ -520,52 +645,51 @@ pub const Table = struct {
         }
     }
 
-    /// Every visible Flow — live and Lingering — with its owning row index.
+    /// Every visible Flow — live and Lingering — with its owning row index,
+    /// each carrying the speed its ring reads at `event_now_ms` (the event
+    /// clock, rates.zig — not the monotonic clock the lifecycle runs on) and
+    /// the name it resolved at creation.
     pub fn collect(
         self: *const Table,
         gpa: std.mem.Allocator,
         out: *std.ArrayList(Entry),
+        event_now_ms: u64,
     ) error{OutOfMemory}!void {
         try out.ensureUnusedCapacity(gpa, self.count());
         var it = self.slots.iterator();
         while (it.next()) |e| {
             const l = e.value_ptr.live orelse continue;
-            out.appendAssumeCapacity(
-                entry(e.key_ptr.*, l.generation, l.row, l.sent, l.recv, false, l.name),
-            );
+            out.appendAssumeCapacity(entry(e.key_ptr.*, l, false, event_now_ms));
         }
         for (self.linger.items[self.linger_head..]) |l| {
-            out.appendAssumeCapacity(
-                entry(l.key, l.generation, l.row, l.sent, l.recv, true, l.name),
-            );
+            out.appendAssumeCapacity(entry(l.key, l.flow, true, event_now_ms));
         }
     }
 
-    fn entry(
-        key: FlowKey,
-        generation: u32,
-        row: u32,
-        sent: u64,
-        recv: u64,
-        lingering: bool,
-        name: FlowName,
-    ) Entry {
-        return .{ .row = row, .flow = .{
-            .proto = key.tuple.proto,
-            .family = key.tuple.family,
-            .local_addr = key.tuple.local_addr,
-            .remote_addr = key.tuple.remote_addr,
-            .local_port = key.tuple.local_port,
-            .remote_port = key.tuple.remote_port,
-            .generation = generation,
-            .sent = sent,
-            .recv = recv,
-            .lingering = lingering,
-            // Borrowed from the Table; the Snapshot build copies them into its
-            // own arena before publishing.
-            .remote_hostname = if (name.text.len > 0) name.text else null,
-            .remote_alias = if (name.alias.len > 0) name.alias else null,
-            .hostname_origin = name.origin,
-        } };
+    fn entry(key: FlowKey, flow: Live, lingering: bool, event_now_ms: u64) Entry {
+        const speed = flow.rate.speed(event_now_ms);
+        const name = flow.name;
+        return .{
+            .row = flow.row,
+            .flow = .{
+                .proto = key.tuple.proto,
+                .family = key.tuple.family,
+                .local_addr = key.tuple.local_addr,
+                .remote_addr = key.tuple.remote_addr,
+                .local_port = key.tuple.local_port,
+                .remote_port = key.tuple.remote_port,
+                .generation = flow.generation,
+                .sent = flow.sent,
+                .recv = flow.recv,
+                .sent_rate = speed.sent,
+                .recv_rate = speed.recv,
+                .lingering = lingering,
+                // Borrowed from the Table; the Snapshot build copies them into its
+                // own arena before publishing.
+                .remote_hostname = if (name.text.len > 0) name.text else null,
+                .remote_alias = if (name.alias.len > 0) name.alias else null,
+                .hostname_origin = name.origin,
+            },
+        };
     }
 };

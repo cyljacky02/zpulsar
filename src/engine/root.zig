@@ -15,6 +15,7 @@ pub const hostnames = @import("hostnames.zig");
 pub const parser = @import("parser.zig");
 pub const process_parser = @import("process_parser.zig");
 pub const process_tdh = @import("process_tdh.zig");
+pub const rates = @import("rates.zig");
 pub const reverse_lookup = @import("reverse_lookup.zig");
 pub const runner = @import("runner.zig");
 pub const snapshot = @import("snapshot.zig");

@@ -11,6 +11,7 @@ const consumer_mod = @import("consumer.zig");
 const core_mod = @import("core.zig");
 const device_map = @import("device_map.zig");
 const etw_session = @import("etw_session.zig");
+const rates = @import("rates.zig");
 const reverse_lookup = @import("reverse_lookup.zig");
 const snapshot = @import("snapshot.zig");
 const sync = @import("sync.zig");
@@ -238,9 +239,9 @@ pub const Engine = struct {
                     self.oom_drops;
                 if (self.core.noteLoss(ring_loss, self.events_lost))
                     self.rebaseline(now);
-                // Flow lifecycle rides the flush tick: Linger expiry and UDP
-                // age-out. OOM leaves the table unchanged; the next tick
-                // retries.
+                // Flow lifecycle rides the flush tick: Linger expiry, UDP
+                // age-out, and the memory caps. OOM leaves the state
+                // unchanged; the next tick retries.
                 self.core.tick(now) catch {};
                 if (now - last_sweep >= sweep_interval_ms) {
                     last_sweep = now;
@@ -249,7 +250,10 @@ pub const Engine = struct {
             }
 
             if (self.core.dirty and now - last_publish >= min_publish_interval_ms) {
-                if (self.core.buildSnapshot()) |snap| {
+                // Speeds are read on the clock the events were stamped with,
+                // not this loop's monotonic tick (rates.zig).
+                const event_now = rates.msFromFileTime(win32.systemTimeAsFileTime());
+                if (self.core.buildSnapshot(event_now)) |snap| {
                     self.published.publish(snap);
                     last_publish = now;
                 } else |_| {} // OOM: retry next pass
