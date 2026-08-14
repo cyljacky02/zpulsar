@@ -13,8 +13,12 @@ An immutable, self-contained view of the Engine's current state — Process Rows
 _Avoid_: Frame, state dump
 
 **Flow**:
-A single network conversation attributed to one process, identified by protocol, owning process, and local/remote endpoint (for ICMP, by protocol, owning process, and remote endpoint). Endpoint reuse after closure starts a new Flow — see Generation.
+A single network conversation attributed to one process, identified by protocol, owning process, and local/remote endpoint (for ICMP, by protocol, address family, and owning process — the send path names no peer, see ADR-0003). Endpoint reuse after closure starts a new Flow — see Generation.
 _Avoid_: Connection (implies TCP only), socket, session
+
+**ICMP Message Count**:
+What an ICMP Flow accumulates in place of bytes: how many messages it sent and received, displayed "N msgs". No user-mode source reports ICMP message sizes, so ICMP contributes zero to every byte total — Flow, Process Row, and session alike.
+_Avoid_: ICMP bytes, estimated bytes (there is no size to estimate from)
 
 **Generation**:
 What distinguishes successive Flows that reuse the same endpoints: a connect, or first activity after closure, starts a new Generation — never resuming the old Flow or its totals.

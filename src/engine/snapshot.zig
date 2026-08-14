@@ -17,6 +17,8 @@ pub const Flow = struct {
     proto: event.Proto,
     family: event.Family,
     /// Raw network-order bytes; v4 occupies the first 4 bytes, rest zero.
+    /// ICMP Flows have no local endpoint and no ports, and their remote is
+    /// all-zero until a correlated reply names the peer (ADR-0003).
     local_addr: [16]u8,
     remote_addr: [16]u8,
     /// Host byte order.
@@ -25,11 +27,20 @@ pub const Flow = struct {
     /// Distinguishes successive Flows reusing the same endpoints
     /// (CONTEXT.md "Generation"); starts at 1 per key.
     generation: u32,
+    /// Bytes. Always zero for ICMP — no user-mode source reports ICMP message
+    /// sizes, so ICMP is counted below instead and can never be mistaken for
+    /// bytes by anything that sums these.
     sent: u64 = 0,
     recv: u64 = 0,
+    /// ICMP messages, rendered "N msgs" (spec issue #18 UI). Always zero for
+    /// TCP and UDP.
+    msgs_sent: u64 = 0,
+    msgs_recv: u64 = 0,
     /// Precomputed speed in bytes per second: the 1 s sliding window over
     /// this Flow's event-time rate ring (rates.zig). Readers display it as
     /// published — a Snapshot never asks the Engine to compute anything.
+    /// Always zero for ICMP, which moves no bytes to bucket; its activity is
+    /// the message counts above.
     sent_rate: u64 = 0,
     recv_rate: u64 = 0,
     /// Closed but still visible, dimmed (CONTEXT.md "Linger").
@@ -67,6 +78,7 @@ pub const Row = struct {
     /// memory cap rolled their totals in here (CONTEXT.md "Eviction" —
     /// attribution coarsens, bytes do not move). It owns no Flows and no PID.
     evicted_processes: bool = false,
+    /// In-session Totals, bytes. ICMP contributes nothing to either.
     sent: u64 = 0,
     recv: u64 = 0,
     /// Precomputed speed in bytes per second: the 1 s sliding window over
@@ -77,6 +89,7 @@ pub const Row = struct {
     /// Live (non-Lingering) flow counts by protocol.
     tcp_conns: u32 = 0,
     udp_socks: u32 = 0,
+    icmp_flows: u32 = 0,
     /// This row's Flows, live and Lingering — a slice of Snapshot.flows.
     flows: []const Flow = &.{},
     /// The Windows services this process hosts, from the SCM map (issue #25),

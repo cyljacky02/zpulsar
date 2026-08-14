@@ -41,6 +41,7 @@ pub const StartError = error{
     OpenFailed,
     TableQueryFailed,
     SpawnFailed,
+    EnableFailed,
 };
 
 pub const Engine = struct {
@@ -71,8 +72,10 @@ pub const Engine = struct {
     /// Bring the hot path up on an already-started session. Order per the
     /// research docs: consumer handle opens first (events buffer in the
     /// session), then the cold-start table seed, then the threads, then the
-    /// CAPTURE_STATE rundown request — issued only once the consumer is live
-    /// so the burst cannot race its startup (kernel-process research §5).
+    /// two things that each trigger a rundown burst — enabling TCPIP for ICMP
+    /// and the CAPTURE_STATE process rundown. Both are issued only once the
+    /// consumer is live so their bursts cannot race its startup
+    /// (kernel-process research §5; icmp-visibility §Addendum).
     pub fn start(gpa: std.mem.Allocator, session: etw_session.Session) StartError!*Engine {
         const self = try gpa.create(Engine);
         errdefer gpa.destroy(self);
@@ -149,6 +152,18 @@ pub const Engine = struct {
         }
         self.consumer_thread = std.Thread.spawn(.{}, consumer_mod.Consumer.run, .{cons}) catch
             return error.SpawnFailed;
+        // ICMP last, and only now: the enable itself triggers TCPIP's
+        // interface/route rundown, which needs a consumer already draining
+        // (etw_session.enableIcmp). Fail-fast on refusal — a monitor that
+        // silently cannot see ICMP is the "silently empty tracer" the spec
+        // rules out. Stopping the session is what unblocks ProcessTrace, so
+        // the consumer is joined before the errdefers free what it reads.
+        if (!session.enableIcmp()) {
+            self.consumer.close();
+            session.stop();
+            self.consumer_thread.join();
+            return error.EnableFailed;
+        }
         self.engine_thread = std.Thread.spawn(.{}, engineMain, .{self}) catch {
             // The consumer unblocks when the caller stops the session
             // (startup is fail-fast; the process exits right after).

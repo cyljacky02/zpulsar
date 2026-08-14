@@ -1,14 +1,14 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
 //! issue #20's tracer plus issue #21's Process Rows, issue #22's Flows,
-//! issue #23's rates, issue #26's Hostname Attribution, and issue #25's
-//! Service Attribution. Brings the `zPulsarNet` session up, runs the
-//! consumer, Engine, resolver and reverse-lookup threads, and renders a live
-//! per-process table from acquired Snapshots — real image names, live down/up
-//! speeds, In-session Totals, dimmed "(exited)" rows, the service a row hosts
-//! (or the "(N services)" fallback with its list), each row's Flows beneath it
-//! with Lingering ones dimmed, remote names marked by the tier that produced
-//! them and each Flow's own service inside a shared host, health flags.
-//! Requires elevation.
+//! issue #23's rates, issue #26's Hostname Attribution, issue #25's Service
+//! Attribution, and issue #27's ICMP. Brings the `zPulsarNet` session up, runs
+//! the consumer, Engine, resolver and reverse-lookup threads, and renders a
+//! live per-process table from acquired Snapshots — real image names, live
+//! down/up speeds, In-session Totals, dimmed "(exited)" rows, the service a
+//! row hosts (or the "(N services)" fallback with its list), each row's Flows
+//! beneath it with Lingering ones dimmed, ICMP counted in messages, remote
+//! names marked by the tier that produced them and each Flow's own service
+//! inside a shared host, health flags. Requires elevation.
 //!
 //! Usage: zpulsar-headless [--duration <seconds>]
 //! Default runs until Ctrl+C.
@@ -133,8 +133,8 @@ fn writeTable(
         try w.writeAll("   [RE-BASELINED: loss occurred, totals may undercount]");
     try w.writeAll("\n\n");
     try w.print(
-        "{s:>8}  {s:>4}  {s:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}\n",
-        .{ "PID", "TCP", "UDP", "DOWN", "UP", "SENT", "RECV", "NAME" },
+        "{s:>8}  {s:>4}  {s:>4}  {s:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}\n",
+        .{ "PID", "TCP", "UDP", "ICMP", "DOWN", "UP", "SENT", "RECV", "NAME" },
     );
 
     // Busiest first; the Snapshot itself stays untouched (it is immutable —
@@ -166,10 +166,11 @@ fn writeTable(
     var service_buf: [256]u8 = undefined;
     for (rows[0..shown]) |r| {
         if (r.exited and vt) try w.writeAll("\x1b[2m");
-        try w.print("{d:>8}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}{s}{s}{s}", .{
+        try w.print("{d:>8}  {d:>4}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}{s}{s}{s}", .{
             r.pid,
             r.tcp_conns,
             r.udp_socks,
+            r.icmp_flows,
             fmtRate(r.recv_rate, &down_buf),
             fmtRate(r.sent_rate, &up_buf),
             fmtBytes(r.sent, &sent_buf),
@@ -189,6 +190,7 @@ fn writeTable(
     }
     if (snap.rows.len > shown)
         try w.print("  … {d} more processes\n", .{snap.rows.len - shown});
+    try writeIcmpSection(w, snap, vt);
     // The spec's status bar: flow count, global speeds, session totals.
     try w.print("\n{d} processes   {d} flows   ↓ {s}  ↑ {s}   total sent {s}   recv {s}\n", .{
         snap.rows.len,
@@ -200,7 +202,42 @@ fn writeTable(
     });
 }
 
+/// ICMP gets its own section (issue #27). It contributes zero bytes by
+/// design, so the byte-ordered table above buries a ping run under hundreds
+/// of idle processes — which is correct for the table and useless for
+/// watching ICMP work.
+fn writeIcmpSection(w: *std.Io.Writer, snap: *engine.snapshot.Snapshot, vt: bool) !void {
+    var shown: usize = 0;
+    for (snap.rows) |r| {
+        for (r.flows) |f| {
+            if (f.proto != .icmp) continue;
+            if (shown == 0) try w.writeAll("\nICMP — message counts, zero bytes by design\n");
+            shown += 1;
+            if (shown > max_icmp_rows) continue;
+            var rbuf: [64]u8 = undefined;
+            const dim = vt and f.lingering;
+            if (dim) try w.writeAll("\x1b[2m");
+            try w.print("{d:>8}  {s:>4}  {s:>18}  {d} sent / {d} recv{s}{s}\n", .{
+                r.pid,
+                @tagName(f.family),
+                fmtEndpoint(f, .remote, &rbuf),
+                f.msgs_sent,
+                f.msgs_recv,
+                if (f.lingering) "  [linger]" else "",
+                if (r.exited) "  (exited)" else "",
+            });
+            if (dim) try w.writeAll("\x1b[22m");
+        }
+    }
+    if (shown == 0) {
+        try w.writeAll("\nICMP — none live\n");
+    } else if (shown > max_icmp_rows) {
+        try w.print("  … {d} more ICMP flows\n", .{shown - max_icmp_rows});
+    }
+}
+
 const max_rows = 25;
+const max_icmp_rows = 12;
 /// Names longer than this are left-truncated — the tail (the exe name, the
 /// registrable domain) is the interesting part, and wrapping lines would break
 /// the in-place repaint.
@@ -209,7 +246,9 @@ const max_hostname_display = 48;
 const max_flows_per_row = 3;
 
 /// One Flow line beneath its row; Lingering flows render dimmed (VT) and
-/// tagged, matching the spec's dimmed Linger display.
+/// tagged, matching the spec's dimmed Linger display. ICMP shows message
+/// counts, never bytes — no user-mode source reports ICMP message sizes
+/// (docs/research/icmp-visibility.md), so its speeds stay zero too.
 fn writeFlow(
     w: *std.Io.Writer,
     f: engine.snapshot.Flow,
@@ -218,8 +257,8 @@ fn writeFlow(
 ) !void {
     var lbuf: [64]u8 = undefined;
     var rbuf: [64]u8 = undefined;
-    var sbuf: [16]u8 = undefined;
-    var rvbuf: [16]u8 = undefined;
+    var sbuf: [32]u8 = undefined;
+    var rvbuf: [32]u8 = undefined;
     var dbuf: [20]u8 = undefined;
     var ubuf: [20]u8 = undefined;
     var svcbuf: [64]u8 = undefined;
@@ -228,12 +267,12 @@ fn writeFlow(
     try w.print("           {s} gen{d}  {s} -> {s}  ↓ {s} ↑ {s}  {s} / {s}", .{
         @tagName(f.proto),
         f.generation,
-        fmtEndpoint(f.family, f.local_addr, f.local_port, &lbuf),
-        fmtEndpoint(f.family, f.remote_addr, f.remote_port, &rbuf),
+        fmtEndpoint(f, .local, &lbuf),
+        fmtEndpoint(f, .remote, &rbuf),
         fmtRate(f.recv_rate, &dbuf),
         fmtRate(f.sent_rate, &ubuf),
-        fmtBytes(f.sent, &sbuf),
-        fmtBytes(f.recv, &rvbuf),
+        fmtActivity(f, .sent, &sbuf),
+        fmtActivity(f, .recv, &rvbuf),
     });
     try writeHostname(w, f, vt and !line_dim);
     try w.writeAll(flowServiceLabel(f, row, &svcbuf));
@@ -293,25 +332,58 @@ fn flowServiceLabel(
     return std.fmt.bufPrint(buf, "  svc={s}", .{name}) catch "";
 }
 
-/// "*" for the zero remote of a placeholder (bound socket, no observed
-/// conversation); v6 prints full-form groups — it's a debug rig.
-fn fmtEndpoint(family: engine.event.Family, addr: [16]u8, port: u16, buf: []u8) []const u8 {
+/// Which half of a Flow to render — naming the side, rather than passing the
+/// fields, keeps a caller from pairing one direction's bytes with the other's
+/// address.
+const Side = enum { local, remote };
+const Direction = enum { sent, recv };
+
+/// A Flow's activity in its own unit: bytes for TCP/UDP, "N msgs" for ICMP.
+fn fmtActivity(f: engine.snapshot.Flow, dir: Direction, buf: []u8) []const u8 {
+    if (f.proto == .icmp) {
+        const msgs = switch (dir) {
+            .sent => f.msgs_sent,
+            .recv => f.msgs_recv,
+        };
+        return std.fmt.bufPrint(buf, "{d} msgs", .{msgs}) catch "?";
+    }
+    return fmtBytes(switch (dir) {
+        .sent => f.sent,
+        .recv => f.recv,
+    }, buf);
+}
+
+/// "*" for an endpoint with nothing to show: a placeholder UDP socket's zero
+/// remote, an ICMP Flow's absent local side, or its peer before the first
+/// reply names it. ICMP has no ports, so its endpoints print bare addresses.
+/// v6 prints full-form groups — it's a debug rig.
+fn fmtEndpoint(f: engine.snapshot.Flow, side: Side, buf: []u8) []const u8 {
+    const addr = switch (side) {
+        .local => f.local_addr,
+        .remote => f.remote_addr,
+    };
+    const port = switch (side) {
+        .local => f.local_port,
+        .remote => f.remote_port,
+    };
     if (port == 0 and std.mem.allEqual(u8, &addr, 0)) return "*";
-    switch (family) {
-        .v4 => return std.fmt.bufPrint(
-            buf,
-            "{d}.{d}.{d}.{d}:{d}",
-            .{ addr[0], addr[1], addr[2], addr[3], port },
-        ) catch "?",
+    const ported = f.proto != .icmp;
+    switch (f.family) {
+        .v4 => {
+            var w: std.Io.Writer = .fixed(buf);
+            w.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch return "?";
+            if (ported) w.print(":{d}", .{port}) catch return "?";
+            return w.buffered();
+        },
         .v6 => {
             var w: std.Io.Writer = .fixed(buf);
-            w.writeByte('[') catch return "?";
+            if (ported) w.writeByte('[') catch return "?";
             var i: usize = 0;
             while (i < 16) : (i += 2) {
                 if (i > 0) w.writeByte(':') catch return "?";
                 w.print("{x}", .{std.mem.readInt(u16, addr[i..][0..2], .big)}) catch return "?";
             }
-            w.print("]:{d}", .{port}) catch return "?";
+            if (ported) w.print("]:{d}", .{port}) catch return "?";
             return w.buffered();
         },
     }

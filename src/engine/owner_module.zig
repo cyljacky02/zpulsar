@@ -82,6 +82,11 @@ pub const OwnerTables = struct {
                 .v4 => self.resolveIn(win32.MIB_UDPROW_OWNER_MODULE, udp4Matches, udpName, true, .udp4, q),
                 .v6 => self.resolveIn(win32.MIB_UDP6ROW_OWNER_MODULE, udp6Matches, udp6Name, true, .udp6, q),
             },
+            // There is no owner-module table for ICMP: IP Helper indexes
+            // sockets, and ICMP has none (issue #27). Core settles ICMP Flows
+            // without ever posting one of these, so this arm is the belt to
+            // that braces — an ICMP query can only ever be answered "no".
+            .icmp => null,
         };
     }
 

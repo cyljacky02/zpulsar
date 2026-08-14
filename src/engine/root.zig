@@ -12,6 +12,7 @@ pub const etw_session = @import("etw_session.zig");
 pub const event = @import("event.zig");
 pub const flows = @import("flows.zig");
 pub const hostnames = @import("hostnames.zig");
+pub const icmp_parser = @import("icmp_parser.zig");
 pub const owner_module = @import("owner_module.zig");
 pub const parser = @import("parser.zig");
 pub const process_parser = @import("process_parser.zig");

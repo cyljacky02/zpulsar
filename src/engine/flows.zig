@@ -1,14 +1,20 @@
 //! The Flow layer (issue #22; CONTEXT.md "Flow", "Generation", "Linger"):
 //! per-Flow identity, lifecycle, and totals inside the Engine thread's
 //! single-threaded state. Flows are keyed (protocol, local endpoint, remote
-//! endpoint, owning PID); endpoint reuse after closure starts a new
-//! Generation — never resuming the old Flow or its totals. Each Flow binds
-//! to its owning Process Row instance (core.zig row index) when it opens and
-//! never migrates. Closed Flows Linger 10 s and then leave the list; their
-//! bytes live on in the Process Row totals, which are independent
-//! accumulators (core.zig), never a sum of visible flows. That independence
-//! is what makes the Flow cap (issue #23) safe: this table holds visibility,
-//! not accounting, so evicting from it can cost detail but never bytes.
+//! endpoint, owning PID) — for ICMP, (protocol, family, owning PID), see
+//! ADR-0003; endpoint reuse after closure starts a new Generation — never
+//! resuming the old Flow or its totals. Each Flow binds to its owning Process
+//! Row instance (core.zig row index) when it opens and never migrates. Closed
+//! Flows Linger 10 s and then leave the list; their bytes live on in the
+//! Process Row totals, which are independent accumulators (core.zig), never a
+//! sum of visible flows. That independence is what makes the Flow cap (issue
+//! #23) safe: this table holds visibility, not accounting, so evicting from
+//! it can cost detail but never bytes.
+//!
+//! ICMP (issue #27) is the exception everywhere: it has no byte source and no
+//! lifecycle events, its Flows count messages, and inbound messages carry no
+//! attribution at all — they are correlated here to the Flow that most
+//! recently sent the paired request, or dropped.
 
 const std = @import("std");
 const event = @import("event.zig");
@@ -21,6 +27,9 @@ const tables = @import("tables.zig");
 pub const linger_ms: u64 = 10_000;
 /// UDP Flows age out after this much inactivity — no lifecycle events exist.
 pub const udp_idle_ms: u64 = 60_000;
+/// ICMP Flows age out sooner (spec issue #18 Data model): a ping run is over
+/// in seconds and nothing else marks its end.
+pub const icmp_idle_ms: u64 = 30_000;
 /// The Flow cap (spec issue #18 Data model, "Memory bounds"): at most this
 /// many visible Flows. Well past any real machine's connection count, so the
 /// cap is a bound on pathology, not a working limit.
@@ -37,6 +46,12 @@ pub const FlowKey = struct {
 };
 
 pub fn flowKey(ev: event.NetEvent) FlowKey {
+    // ICMP identity is (protocol, family, owning PID). The spec's original
+    // key included the remote address, but under the session's `ut:Global`
+    // keyword the send path logs no addresses at all, so an outbound message
+    // cannot name its peer — see ADR-0003. The peer is learned from the
+    // correlated replies and carried for display only.
+    if (ev.proto == .icmp) return icmpKey(ev.family, ev.pid);
     return .{ .pid = ev.pid, .tuple = .{
         .proto = ev.proto,
         .family = ev.family,
@@ -46,6 +61,55 @@ pub fn flowKey(ev: event.NetEvent) FlowKey {
         .remote_port = ev.remote_port,
     } };
 }
+
+fn icmpKey(family: event.Family, pid: u32) FlowKey {
+    return .{ .pid = pid, .tuple = .{
+        .proto = .icmp,
+        .family = family,
+        .local_addr = @splat(0),
+        .remote_addr = @splat(0),
+        .local_port = 0,
+        .remote_port = 0,
+    } };
+}
+
+/// Every request/reply type pair ICMP correlation recognizes — the one table
+/// both directions of the lookup read, so a pair can never be half-added.
+/// The pairs the spec names are the IPv4 numbering (echo 8→0, timestamp
+/// 13→14); ICMPv6 renumbered echo to 128→129 (RFC 4443) and has no timestamp
+/// messages, so `ping -6` needs its own row. Everything absent here — errors,
+/// neighbor discovery, unsolicited requests — pairs with nothing, which is
+/// exactly why unmatched inbound ICMP is dropped.
+const reply_pairs = [_]struct { family: event.Family, request: u8, reply: u8 }{
+    .{ .family = .v4, .request = 8, .reply = 0 },
+    .{ .family = .v4, .request = 13, .reply = 14 },
+    .{ .family = .v6, .request = 128, .reply = 129 },
+};
+
+/// Which outbound request an inbound ICMP message can be a reply to.
+fn pairedRequestType(family: event.Family, reply_type: u8) ?u8 {
+    for (reply_pairs) |p| {
+        if (p.family == family and p.reply == reply_type) return p.request;
+    }
+    return null;
+}
+
+/// True for the request types `pairedRequestType` can name — the only ones
+/// worth remembering a requester for.
+fn expectsReply(family: event.Family, request_type: u8) bool {
+    for (reply_pairs) |p| {
+        if (p.family == family and p.request == request_type) return true;
+    }
+    return false;
+}
+
+/// The correlation index's key. Its value space is bounded by the handful of
+/// request types above, so the index cannot grow with traffic and needs no
+/// pruning.
+const IcmpRequestKey = struct {
+    family: event.Family,
+    request_type: u8,
+};
 
 /// How far Service Attribution (issue #25) has got with a Flow. The Flow
 /// layer only stores this; which tier applies is core.zig's decision.
@@ -99,7 +163,16 @@ pub const Live = struct {
     row: u32,
     sent: u64 = 0,
     recv: u64 = 0,
-    /// Event-time byte history behind this Flow's displayed speed.
+    /// ICMP messages, which is what ICMP moves instead of bytes — no
+    /// user-mode source reports its message sizes (ADR-0003). Zero for TCP
+    /// and UDP, whose `sent`/`recv` above stay the only byte counters.
+    msgs_sent: u64 = 0,
+    msgs_recv: u64 = 0,
+    /// ICMP only: the peer, learned from the replies this Flow correlated
+    /// (ADR-0003) — display, never identity. All-zero until the first reply.
+    icmp_remote: [16]u8 = @splat(0),
+    /// Event-time byte history behind this Flow's displayed speed. An ICMP
+    /// Flow never buckets anything into it: it has no bytes to bucket.
     rate: rates.Ring = .{},
     last_activity_ms: u64,
     /// When the Flow opened — what the reverse-lookup grace is measured from.
@@ -179,6 +252,10 @@ pub const Table = struct {
     linger: std.ArrayList(Lingering) = .empty,
     linger_head: usize = 0,
     live_count: usize = 0,
+    /// Which PID most recently sent an outbound ICMP request of a given
+    /// (family, type) — the whole of inbound correlation (ADR-0003).
+    /// Overwriting on every request is what "most recent request wins" means.
+    icmp_requests: std.AutoHashMapUnmanaged(IcmpRequestKey, u32) = .empty,
     /// Sweep scratch, reused per sweep: the table snapshot's tuples, and the
     /// tuples still-live Flows cover.
     scratch_tuples: std.AutoHashMapUnmanaged(event.ConnKey, void) = .empty,
@@ -193,6 +270,7 @@ pub const Table = struct {
         for (self.linger.items[self.linger_head..]) |*l| l.flow.name.deinit(gpa);
         self.slots.deinit(gpa);
         self.linger.deinit(gpa);
+        self.icmp_requests.deinit(gpa);
         self.scratch_tuples.deinit(gpa);
         self.scratch_live.deinit(gpa);
     }
@@ -240,9 +318,54 @@ pub const Table = struct {
         return &gop.value_ptr.live.?;
     }
 
+    /// Remember an outbound ICMP request as the one a matching reply belongs
+    /// to. Only request types that have a paired reply are worth recording;
+    /// the rest can never be matched anyway.
+    pub fn noteIcmpRequest(
+        self: *Table,
+        gpa: std.mem.Allocator,
+        family: event.Family,
+        icmp_type: u8,
+        pid: u32,
+    ) error{OutOfMemory}!void {
+        if (!expectsReply(family, icmp_type)) return;
+        try self.icmp_requests.put(gpa, .{ .family = family, .request_type = icmp_type }, pid);
+    }
+
+    /// The live Flow an inbound ICMP message belongs to: the one whose
+    /// process most recently sent the request this message's type pairs with.
+    /// Null means unmatched — the caller drops the message outright rather
+    /// than inventing activity for a process that asked for nothing
+    /// (spec issue #18: "Unmatched inbound ICMP is dropped").
+    ///
+    /// The returned pointer is into `slots` and is invalidated by anything
+    /// that inserts a Flow; use it before the next `touch`.
+    pub fn matchIcmpReply(
+        self: *Table,
+        family: event.Family,
+        reply_type: u8,
+        now_ms: u64,
+    ) ?*Live {
+        const request_type = pairedRequestType(family, reply_type) orelse return null;
+        const pid = self.icmp_requests.get(
+            .{ .family = family, .request_type = request_type },
+        ) orelse return null;
+        // The requester's Flow may have aged out or its process exited since
+        // — a reply arriving that late is as unattributable as an unsolicited
+        // one.
+        const slot = self.slots.getPtr(icmpKey(family, pid)) orelse return null;
+        if (slot.live) |*l| {
+            l.last_activity_ms = now_ms;
+            return l;
+        }
+        return null;
+    }
+
     /// The tiered lookup, done once per Flow. A bound socket with no observed
     /// conversation (the UDP table's zero-remote placeholder) has no remote to
-    /// name.
+    /// name. An ICMP Flow has no remote in its key either, so it takes this
+    /// same path and shows its bare peer — the address is only learned later,
+    /// from replies, and by then the name is settled (ADR-0003).
     fn resolveName(
         gpa: std.mem.Allocator,
         key: FlowKey,
@@ -339,13 +462,19 @@ pub const Table = struct {
         }
         self.compactLinger();
 
-        // UDP age-out. close() never removes slots, so closing while
+        // Inactivity age-out. close() never removes slots, so closing while
         // iterating is safe.
         var it = self.slots.iterator();
         while (it.next()) |e| {
-            if (e.key_ptr.tuple.proto != .udp) continue;
+            const idle_limit: u64 = switch (e.key_ptr.tuple.proto) {
+                // TCP closure is event-driven, with the table sweep as its
+                // safety net — it never ages out on silence.
+                .tcp => continue,
+                .udp => udp_idle_ms,
+                .icmp => icmp_idle_ms,
+            };
             const l = e.value_ptr.live orelse continue;
-            if (now_ms - l.last_activity_ms >= udp_idle_ms) {
+            if (now_ms - l.last_activity_ms >= idle_limit) {
                 _ = try self.close(gpa, e.key_ptr.*, now_ms);
                 changed = true;
             }
@@ -360,6 +489,9 @@ pub const Table = struct {
     /// entirely, so the next activity on it opens a fresh Generation with
     /// its own totals rather than resuming what the Row already holds.
     /// Bytes are never at stake here: no accounting lives in this table.
+    /// ICMP message counts are the one thing that lives nowhere else, so an
+    /// evicted ICMP Flow does lose them — the cap is a bound on pathology,
+    /// and ICMP contributes a handful of Flows to it.
     pub fn evict(self: *Table, gpa: std.mem.Allocator) error{OutOfMemory}!bool {
         if (self.count() <= cap) return false;
 
@@ -462,6 +594,12 @@ pub const Table = struct {
             if (e.value_ptr.live == null) continue;
             const tuple = e.key_ptr.tuple;
             switch (tuple.proto) {
+                // ICMP is invisible to the owner tables (IP Helper has no
+                // ICMP equivalent of GetExtendedTcpTable, research §3), so
+                // their silence says nothing: the sweep must neither close
+                // an ICMP Flow nor count it as covering a table row. ICMP
+                // ages out on inactivity instead.
+                .icmp => continue,
                 .tcp => if (!self.scratch_tuples.contains(tuple)) {
                     _ = try self.close(gpa, e.key_ptr.*, now_ms);
                     changed = true;
@@ -736,18 +874,26 @@ pub const Table = struct {
     fn entry(key: FlowKey, flow: Live, lingering: bool, event_now_ms: u64) Entry {
         const speed = flow.rate.speed(event_now_ms);
         const name = flow.name;
+        // ICMP keeps its peer outside the key: it is learned from replies, so
+        // it is published from the Flow, not from the identity.
+        const remote_addr = if (key.tuple.proto == .icmp)
+            flow.icmp_remote
+        else
+            key.tuple.remote_addr;
         return .{
             .row = flow.row,
             .flow = .{
                 .proto = key.tuple.proto,
                 .family = key.tuple.family,
                 .local_addr = key.tuple.local_addr,
-                .remote_addr = key.tuple.remote_addr,
+                .remote_addr = remote_addr,
                 .local_port = key.tuple.local_port,
                 .remote_port = key.tuple.remote_port,
                 .generation = flow.generation,
                 .sent = flow.sent,
                 .recv = flow.recv,
+                .msgs_sent = flow.msgs_sent,
+                .msgs_recv = flow.msgs_recv,
                 .sent_rate = speed.sent,
                 .recv_rate = speed.recv,
                 .lingering = lingering,
