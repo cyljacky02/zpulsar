@@ -16,6 +16,11 @@ const event = @import("event.zig");
 pub const SeededConn = struct {
     key: event.ConnKey,
     pid: u32,
+    /// TCP row in a half-closed state (FIN_WAIT/CLOSE_WAIT/…): it still
+    /// counts as presence — data can move and a live Flow must stay open —
+    /// but it seeds nothing, or event-closed Flows whose row outlives them
+    /// (CLOSE_WAIT sits for minutes) would come back as ghost Generations.
+    closing: bool = false,
 };
 
 pub const SnapshotError = error{ OutOfMemory, TableQueryFailed };
@@ -105,14 +110,23 @@ fn appendRows(
     return true;
 }
 
-/// States that mean "this connection is over". A TIME_WAIT remnant outlives
-/// its connection by minutes — seeding it would resurrect every event-closed
-/// Flow on the next sweep. Half-closed states stay: data can still move, and
-/// the event-driven close beats the sweep to genuinely dead ones.
-fn deadTcpState(dw_state: u32) bool {
-    return dw_state == @intFromEnum(win32.MIB_TCP_STATE.CLOSED) or
-        dw_state == @intFromEnum(win32.MIB_TCP_STATE.TIME_WAIT) or
-        dw_state == @intFromEnum(win32.MIB_TCP_STATE.DELETE_TCB);
+const TcpRowLife = enum { open, closing, dead };
+
+/// How a TCP table state maps into the Flow layer. Dead rows never appear —
+/// a TIME_WAIT remnant outlives its connection by minutes, and seeding it
+/// would revive every event-closed Flow as a ghost on the next sweep.
+/// Half-closed rows are presence without seeding (SeededConn.closing).
+/// Unknown states classify as closing: presence is safe, seeding is not.
+fn tcpRowLife(dw_state: u32) TcpRowLife {
+    const S = win32.MIB_TCP_STATE;
+    if (dw_state == @intFromEnum(S.CLOSED) or
+        dw_state == @intFromEnum(S.TIME_WAIT) or
+        dw_state == @intFromEnum(S.DELETE_TCB)) return .dead;
+    if (dw_state == @intFromEnum(S.LISTEN) or
+        dw_state == @intFromEnum(S.SYN_SENT) or
+        dw_state == @intFromEnum(S.SYN_RCVD) or
+        dw_state == @intFromEnum(S.ESTAB)) return .open;
+    return .closing;
 }
 
 /// The port DWORDs hold the u16 port in network byte order in their low
@@ -129,8 +143,9 @@ fn addr4(dw: u32) [16]u8 {
 }
 
 fn tcp4Conn(row: win32.MIB_TCPROW_OWNER_PID) ?SeededConn {
-    if (deadTcpState(row.dwState)) return null;
-    return .{ .pid = row.dwOwningPid, .key = .{
+    const life = tcpRowLife(row.dwState);
+    if (life == .dead) return null;
+    return .{ .pid = row.dwOwningPid, .closing = life == .closing, .key = .{
         .proto = .tcp,
         .family = .v4,
         .local_addr = addr4(row.dwLocalAddr),
@@ -141,8 +156,9 @@ fn tcp4Conn(row: win32.MIB_TCPROW_OWNER_PID) ?SeededConn {
 }
 
 fn tcp6Conn(row: win32.MIB_TCP6ROW_OWNER_PID) ?SeededConn {
-    if (deadTcpState(row.dwState)) return null;
-    return .{ .pid = row.dwOwningPid, .key = .{
+    const life = tcpRowLife(row.dwState);
+    if (life == .dead) return null;
+    return .{ .pid = row.dwOwningPid, .closing = life == .closing, .key = .{
         .proto = .tcp,
         .family = .v6,
         .local_addr = row.ucLocalAddr,
@@ -290,8 +306,8 @@ test "udp rows seed local-only keys matching the event-side normalization" {
 
 test "dead-state TCP rows never become seeded connections" {
     // TIME_WAIT (and CLOSED/DELETE_TCB) remnants outlive the connection by
-    // minutes; seeding them would resurrect every event-closed Flow on the
-    // next reconciliation sweep.
+    // minutes; seeding them would revive every event-closed Flow as a ghost
+    // on the next reconciliation sweep.
     const template = win32.MIB_TCPROW_OWNER_PID{
         .dwState = 0,
         .dwLocalAddr = std.mem.bytesToValue(u32, &[4]u8{ 192, 168, 1, 2 }),
@@ -308,16 +324,19 @@ test "dead-state TCP rows never become seeded connections" {
     time_wait.dwState = @intFromEnum(win32.MIB_TCP_STATE.TIME_WAIT);
     var delete_tcb = template;
     delete_tcb.dwState = @intFromEnum(win32.MIB_TCP_STATE.DELETE_TCB);
+    var fin_wait2 = template;
+    fin_wait2.dwState = @intFromEnum(win32.MIB_TCP_STATE.FIN_WAIT2);
 
-    const rows = [_]win32.MIB_TCPROW_OWNER_PID{ closed, established, time_wait, delete_tcb };
+    const rows = [_]win32.MIB_TCPROW_OWNER_PID{ closed, established, time_wait, delete_tcb, fin_wait2 };
     const buf = try testTableBuffer(win32.MIB_TCPROW_OWNER_PID, std.testing.allocator, &rows);
     defer std.testing.allocator.free(buf);
 
     var list: std.ArrayList(SeededConn) = .empty;
     defer list.deinit(std.testing.allocator);
     try std.testing.expect(try appendRows(win32.MIB_TCPROW_OWNER_PID, tcp4Conn, &list, std.testing.allocator, buf));
-    try std.testing.expectEqual(@as(usize, 1), list.items.len);
-    try std.testing.expectEqual(@as(u16, 51000), list.items[0].key.local_port);
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expect(!list.items[0].closing); // ESTABLISHED seeds
+    try std.testing.expect(list.items[1].closing); // FIN_WAIT2 is presence only
 }
 
 test "a buffer that doesn't hold the rows it claims is rejected" {

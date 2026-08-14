@@ -20,7 +20,9 @@ pub const flush_interval_ms: u64 = 120;
 /// Helper tables — the safety net for lost TCP close events.
 pub const sweep_interval_ms: u64 = 10_000;
 /// EventsLost is polled at ~1 s — losses are rare and the query costs a
-/// control-path call.
+/// control-path call. This is a superset of the sweep's check-loss duty
+/// (spec: "the sweep also checks for event loss"), and the loss re-baseline
+/// runs the same table reconcile the sweep does.
 const loss_check_every_ticks: u32 = 8;
 /// Publishing is cheap but allocates an arena; bound it below the flush
 /// cadence so a trickle byte still surfaces within the latency budget.

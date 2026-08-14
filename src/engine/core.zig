@@ -134,8 +134,8 @@ pub const Core = struct {
     }
 
     /// Build an immutable Snapshot of the current state in its own arena:
-    /// one row per PID that has totals or owns a Flow (pre-existing idle
-    /// connections appear), sorted by PID, each row's Flows grouped under it.
+    /// one row per PID that has totals or owns a Flow (seeded pre-existing
+    /// Flows appear), sorted by PID, each row's Flows grouped under it.
     pub fn buildSnapshot(self: *Core) error{OutOfMemory}!*snapshot.Snapshot {
         // Flows first, sorted (pid, identity, generation): each row's Flows
         // become one contiguous, deterministically ordered span.
@@ -444,7 +444,8 @@ test "endpoint reuse after closure starts a new Generation with fresh totals" {
     try std.testing.expectEqual(@as(u64, 500), row.flows[0].sent);
     try std.testing.expectEqual(@as(u32, 2), row.flows[1].generation);
     try std.testing.expect(!row.flows[1].lingering);
-    // Totals never resurrect: the new Generation starts from its own bytes.
+    // The old totals are never resumed: the new Generation starts from its
+    // own bytes.
     try std.testing.expectEqual(@as(u64, 7), row.flows[1].sent);
     // The Process Row accumulates across Generations.
     try std.testing.expectEqual(@as(u64, 507), row.sent);
@@ -630,6 +631,36 @@ test "process exit closes its live Flows into normal Linger" {
     try std.testing.expectEqual(@as(u64, 55), row2.sent);
 }
 
+test "a half-closed table row is presence, never a seed" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // An event-closed Flow whose table row lingers in FIN_WAIT/CLOSE_WAIT
+    // (those states can persist for minutes) must not come back as a ghost
+    // zero-byte Generation.
+    const data = testEvent(.send, .tcp, 100, 30, 51000);
+    try core.applyEvent(data, 0);
+    var fin = data;
+    fin.op = .disconnect;
+    try core.applyEvent(fin, 1000);
+    try core.reconcile(&.{.{ .pid = 100, .key = event.connKey(data), .closing = true }}, 5000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u32, 0), row.tcp_conns);
+
+    // But a live Flow whose row went half-closed stays open — data can
+    // still move; the event-driven close will land.
+    const live = testEvent(.send, .tcp, 200, 40, 52000);
+    try core.applyEvent(live, 0);
+    try core.reconcile(&.{.{ .pid = 200, .key = event.connKey(live), .closing = true }}, 5000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    try std.testing.expectEqual(@as(u32, 1), rowForPid(snap2.rows, 200).?.tcp_conns);
+}
+
 test "a held Snapshot never changes while the Engine keeps updating" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();
@@ -648,9 +679,11 @@ test "a held Snapshot never changes while the Engine keeps updating" {
     core.flagRebaselined();
     published.publish(try core.buildSnapshot());
 
-    // The held reader still sees the old world, bit for bit.
+    // The held reader still sees the old world, bit for bit — its Flows too.
     try std.testing.expectEqual(@as(usize, 1), held.rows.len);
     try std.testing.expectEqual(@as(u64, 1000), held.rows[0].sent);
+    try std.testing.expectEqual(@as(usize, 1), held.rows[0].flows.len);
+    try std.testing.expectEqual(@as(u64, 1000), held.rows[0].flows[0].sent);
     try std.testing.expect(!held.health.rebaselined);
 
     // A fresh reader sees the new one.

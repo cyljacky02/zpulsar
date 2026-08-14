@@ -2,9 +2,10 @@
 //! per-Flow identity, lifecycle, and totals inside the Engine thread's
 //! single-threaded state. Flows are keyed (protocol, local endpoint, remote
 //! endpoint, owning PID); endpoint reuse after closure starts a new
-//! Generation — totals never resurrect. Closed Flows Linger 10 s and then
-//! leave the list; their bytes live on in the Process Row totals, which are
-//! independent accumulators (core.zig), never a sum of visible flows.
+//! Generation — never resuming the old Flow or its totals. Closed Flows
+//! Linger 10 s and then leave the list; their bytes live on in the Process
+//! Row totals, which are independent accumulators (core.zig), never a sum
+//! of visible flows.
 
 const std = @import("std");
 const event = @import("event.zig");
@@ -132,7 +133,7 @@ pub const Table = struct {
             if (!gop.found_existing) gop.value_ptr.* = 0;
             gop.value_ptr.* += 1;
         }
-        errdefer if (key.tuple.proto == .udp) self.unbumpUdpLocal(key);
+        errdefer if (key.tuple.proto == .udp) self.releaseUdpLocal(key);
         const gop = try self.slots.getOrPut(gpa, key);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.last_gen += 1;
@@ -184,11 +185,11 @@ pub const Table = struct {
         }
         slot.live = null;
         self.live_count -= 1;
-        self.unbumpUdpLocal(placeholder);
+        self.releaseUdpLocal(placeholder);
         if (slot.linger_count == 0) _ = self.slots.remove(placeholder);
     }
 
-    fn unbumpUdpLocal(self: *Table, key: FlowKey) void {
+    fn releaseUdpLocal(self: *Table, key: FlowKey) void {
         const local = udpLocalKey(key);
         const n = self.udp_local.getPtr(local).?;
         n.* -= 1;
@@ -215,7 +216,7 @@ pub const Table = struct {
         slot.live = null;
         slot.linger_count += 1;
         self.live_count -= 1;
-        if (key.tuple.proto == .udp) self.unbumpUdpLocal(key);
+        if (key.tuple.proto == .udp) self.releaseUdpLocal(key);
         return true;
     }
 
@@ -311,10 +312,13 @@ pub const Table = struct {
                 },
             }
         }
-        // Seed table rows whose key has no live Flow. A live UDP Flow on the
-        // same socket already represents it — the local-only table row would
-        // double it (the seed's job is presence, and presence is covered).
+        // Seed table rows whose key has no live Flow. Half-closed rows are
+        // presence only — seeding them would revive event-closed Flows as
+        // ghosts. A live UDP Flow on the same socket already represents it —
+        // the local-only table row would double it (the seed's job is
+        // presence, and presence is covered).
         for (rows) |r| {
+            if (r.closing) continue;
             const key: FlowKey = .{ .tuple = r.key, .pid = r.pid };
             if (self.slots.getPtr(key)) |slot| {
                 if (slot.live != null) continue;
@@ -357,31 +361,27 @@ pub const Table = struct {
         var it = self.slots.iterator();
         while (it.next()) |e| {
             const l = e.value_ptr.live orelse continue;
-            out.appendAssumeCapacity(.{ .pid = e.key_ptr.pid, .flow = .{
-                .proto = e.key_ptr.tuple.proto,
-                .family = e.key_ptr.tuple.family,
-                .local_addr = e.key_ptr.tuple.local_addr,
-                .remote_addr = e.key_ptr.tuple.remote_addr,
-                .local_port = e.key_ptr.tuple.local_port,
-                .remote_port = e.key_ptr.tuple.remote_port,
-                .generation = l.generation,
-                .sent = l.sent,
-                .recv = l.recv,
-            } });
+            out.appendAssumeCapacity(
+                entry(e.key_ptr.*, l.generation, l.sent, l.recv, false),
+            );
         }
         for (self.linger.items[self.linger_head..]) |l| {
-            out.appendAssumeCapacity(.{ .pid = l.key.pid, .flow = .{
-                .proto = l.key.tuple.proto,
-                .family = l.key.tuple.family,
-                .local_addr = l.key.tuple.local_addr,
-                .remote_addr = l.key.tuple.remote_addr,
-                .local_port = l.key.tuple.local_port,
-                .remote_port = l.key.tuple.remote_port,
-                .generation = l.generation,
-                .sent = l.sent,
-                .recv = l.recv,
-                .lingering = true,
-            } });
+            out.appendAssumeCapacity(entry(l.key, l.generation, l.sent, l.recv, true));
         }
+    }
+
+    fn entry(key: FlowKey, generation: u32, sent: u64, recv: u64, lingering: bool) Entry {
+        return .{ .pid = key.pid, .flow = .{
+            .proto = key.tuple.proto,
+            .family = key.tuple.family,
+            .local_addr = key.tuple.local_addr,
+            .remote_addr = key.tuple.remote_addr,
+            .local_port = key.tuple.local_port,
+            .remote_port = key.tuple.remote_port,
+            .generation = generation,
+            .sent = sent,
+            .recv = recv,
+            .lingering = lingering,
+        } };
     }
 };
