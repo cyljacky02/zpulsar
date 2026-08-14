@@ -293,6 +293,7 @@ test "udp rows seed local-only keys matching the event-side normalization" {
         .op = .send,
         .proto = .udp,
         .family = .v4,
+        .icmp_type = 0,
         .pid = 555,
         .size = 10,
         .local_addr = [4]u8{ 10, 0, 0, 5 } ++ @as([12]u8, @splat(0)),

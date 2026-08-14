@@ -39,6 +39,7 @@ pub fn parseWithOffsets(
         .op = class.op,
         .proto = class.proto,
         .family = class.family,
+        .icmp_type = 0,
         .pid = std.mem.readInt(u32, user_data[off.pid..][0..4], .little),
         .size = 0,
         .local_addr = @splat(0),

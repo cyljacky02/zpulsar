@@ -1,16 +1,19 @@
 //! The ETW consumer thread (ADR-0002 thread 2): blocked in ProcessTrace on
 //! the `zPulsarNet` real-time session, parse-only — every event becomes a
 //! fixed-size record pushed onto an SPSC ring, or nothing. Dispatch is on
-//! the provider GUID first (Kernel-Network and Kernel-Process share the
-//! session), then on (event id, version). Known layouts take the
-//! fixed-offset hot path; unknown versions route to the TDH fallbacks. The
-//! shared wake event is set exactly on either ring's empty→non-empty
-//! transition.
+//! the provider GUID first (Kernel-Network, Kernel-Process and TCPIP share
+//! the session), then on (event id, version). Known layouts take the
+//! fixed-offset hot path; unknown Kernel-Network and Kernel-Process versions
+//! route to the TDH fallbacks, while unknown TCPIP ones drop — that payload's
+//! length-prefixed addresses are exactly what flat offset derivation cannot
+//! walk (icmp_parser.zig). The shared wake event is set exactly on either
+//! ring's empty→non-empty transition.
 
 const std = @import("std");
 const win32 = @import("win32");
 const etw_session = @import("etw_session.zig");
 const event = @import("event.zig");
+const icmp_parser = @import("icmp_parser.zig");
 const parser = @import("parser.zig");
 const process_parser = @import("process_parser.zig");
 const process_tdh = @import("process_tdh.zig");
@@ -101,7 +104,7 @@ pub const Consumer = struct {
     }
 
     /// Provider dispatch. The session also delivers ETW's own control events
-    /// (e.g. the EventTrace header); anything but our two providers is
+    /// (e.g. the EventTrace header); anything but our three providers is
     /// ignored.
     fn handleRecord(self: *Consumer, rec: *win32.EVENT_RECORD) void {
         const provider = &rec.EventHeader.ProviderId.Bytes;
@@ -109,7 +112,28 @@ pub const Consumer = struct {
             self.handleNetRecord(rec);
         } else if (std.mem.eql(u8, provider, &etw_session.kernel_process_guid.Bytes)) {
             self.handleProcessRecord(rec);
+        } else if (std.mem.eql(u8, provider, &etw_session.tcpip_guid.Bytes)) {
+            self.handleIcmpRecord(rec);
         }
+    }
+
+    /// TCPIP's ICMP messages (issue #27). Unlike Kernel-Network, the
+    /// attribution PID here *is* the header PID — on the send path it is the
+    /// verified real caller (icmp-visibility research §4). The `ut:Global`
+    /// keyword also carries ~200 interface/address/route tasks whose
+    /// session-start rundown burst outnumbers everything else; they fail the
+    /// id check inside `parse` and so cost one comparison and never reach the
+    /// ring, where they could have displaced real records.
+    fn handleIcmpRecord(self: *Consumer, rec: *win32.EVENT_RECORD) void {
+        const desc = rec.EventHeader.EventDescriptor;
+        const ev = icmp_parser.parse(
+            desc.Id,
+            desc.Version,
+            userData(rec),
+            rec.EventHeader.ProcessId,
+            rec.EventHeader.TimeStamp.QuadPart,
+        ) orelse return;
+        if (self.ring.push(ev) == .pushed_was_empty) self.wake.set();
     }
 
     /// The per-event Kernel-Network hot path. The attribution PID comes from
@@ -319,6 +343,58 @@ test "unknown kernel-process versions route to the process TDH fallback" {
     const ev = rig.process_ring.pop() orelse return error.NothingPushed;
     try std.testing.expectEqual(event.ProcessKind.rundown, ev.kind);
     try std.testing.expectEqual(@as(u32, 31337), ev.pid);
+}
+
+/// A valid 1422v0 send payload: five u32s, then two zero-length addresses —
+/// the shape the send path logs under `ut:Global` (ADR-0003).
+const icmp_send_payload = blk: {
+    var b: [32]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], 1, .little); // IPTransportProtocol: ICMPv4
+    std.mem.writeInt(u32, b[4..8], 0, .little); // PathDirection: send
+    std.mem.writeInt(u32, b[8..12], 8, .little); // IcmpType: echo request
+    break :blk b;
+};
+
+test "ICMP events take the event-header PID, not the payload" {
+    const rig = try TestRig.init();
+    defer rig.deinit();
+
+    var rec = testRecord(etw_session.tcpip_guid, 1422, 0, &icmp_send_payload, &rig.consumer);
+    rec.EventHeader.ProcessId = 51752;
+    Consumer.eventRecordCallback(&rec);
+
+    const ev = rig.ring.pop() orelse return error.NothingPushed;
+    try std.testing.expectEqual(event.Proto.icmp, ev.proto);
+    try std.testing.expectEqual(event.Op.send, ev.op);
+    try std.testing.expectEqual(@as(u32, 51752), ev.pid);
+    try std.testing.expectEqual(@as(u8, 8), ev.icmp_type);
+    try std.testing.expectEqual(@as(u32, 0), ev.size);
+    try std.testing.expectEqual(sync.WakeEvent.WaitResult.signaled, rig.wake.timedWait(0));
+}
+
+test "the TCPIP session-start rundown burst reaches neither ring" {
+    const rig = try TestRig.init();
+    defer rig.deinit();
+    rig.consumer.process_fallback = &testProcessFallback;
+    test_process_fallback_calls = 0;
+
+    // `ut:Global` carries ~200 interface/address/route tasks; at session
+    // start they arrive as a one-time burst dominated by IP neighbor rundown
+    // (1542). Feeding a burst of them through the real dispatch must leave
+    // both rings untouched — nothing to displace real records, and no wake
+    // that would spin the Engine thread.
+    const burst_ids = [_]u16{ 1542, 1542, 1542, 1452, 1618, 1202, 1527, 1223, 1518, 1423, 1424 };
+    for (burst_ids) |id| {
+        var rec = testRecord(etw_session.tcpip_guid, id, 0, &icmp_send_payload, &rig.consumer);
+        rec.EventHeader.ProcessId = 4;
+        Consumer.eventRecordCallback(&rec);
+    }
+
+    try std.testing.expect(rig.ring.isEmpty());
+    try std.testing.expect(rig.process_ring.isEmpty());
+    try std.testing.expectEqual(@as(u64, 0), rig.ring.droppedTotal());
+    try std.testing.expectEqual(@as(u32, 0), test_process_fallback_calls);
+    try std.testing.expectEqual(sync.WakeEvent.WaitResult.timeout, rig.wake.timedWait(0));
 }
 
 test "foreign providers and excluded events never reach either ring" {

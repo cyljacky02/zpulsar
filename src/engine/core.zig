@@ -84,6 +84,7 @@ pub const Core = struct {
     ) error{OutOfMemory}!void {
         switch (ev.op) {
             .send, .recv => {
+                if (ev.proto == .icmp) return self.applyIcmp(ev, now_ms);
                 const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
                 const row = &self.rows.items[idx];
                 if (ev.op == .send)
@@ -93,7 +94,10 @@ pub const Core = struct {
                 // First activity opens the Flow (raced the table snapshot,
                 // or a new Generation after closure).
                 const live = try self.flows.touch(self.gpa, flows.flowKey(ev), idx, now_ms);
-                if (ev.op == .send) live.sent += ev.size else live.recv += ev.size;
+                if (ev.op == .send)
+                    live.counts.sent += ev.size
+                else
+                    live.counts.recv += ev.size;
                 self.dirty = true;
             },
             .connect => {
@@ -106,6 +110,44 @@ pub const Core = struct {
                     self.dirty = true;
             },
         }
+    }
+
+    /// ICMP's own accounting (issue #27). Nothing here touches a byte total:
+    /// no user-mode source reports ICMP message sizes, so ICMP Flows count
+    /// messages and In-session Totals stay pure bytes.
+    ///
+    /// Outbound messages carry the real caller in the event-header PID and
+    /// open or refresh that process's ICMP Flow. Inbound messages carry no
+    /// attribution whatsoever — they are correlated to the Flow whose process
+    /// most recently sent the request they pair with, and **dropped entirely**
+    /// when nothing matches: unsolicited inbound ICMP must leave no trace
+    /// anywhere, not even a Process Row (spec issue #18 Capture: ICMP).
+    /// ICMP has no lifecycle events, so `ev.op` is only ever send or recv
+    /// here — the caller's switch already narrowed it.
+    fn applyIcmp(self: *Core, ev: event.NetEvent, now_ms: u64) error{OutOfMemory}!void {
+        if (ev.op == .send) {
+            const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
+            const live = try self.flows.touch(self.gpa, flows.flowKey(ev), idx, now_ms);
+            live.counts.msgs_sent += 1;
+            notePeer(live, ev.remote_addr);
+            try self.flows.noteIcmpRequest(self.gpa, ev.family, ev.icmp_type, ev.pid);
+            self.dirty = true;
+            return;
+        }
+        const live = self.flows.matchIcmpReply(ev.family, ev.icmp_type, now_ms) orelse return;
+        live.counts.msgs_recv += 1;
+        notePeer(live, ev.remote_addr);
+        self.dirty = true;
+    }
+
+    /// Learn an ICMP Flow's peer from whichever message names one. Under this
+    /// session's keyword only replies do (ADR-0003), which is why the peer is
+    /// unknown until one arrives — but a build whose send path logs addresses
+    /// would name it on the first request instead, so take it from either.
+    /// Latest wins: the Flow shows who it is talking to now.
+    fn notePeer(live: anytype, remote_addr: [16]u8) void {
+        if (std.mem.allEqual(u8, &remote_addr, 0)) return;
+        live.icmp_remote = remote_addr;
     }
 
     /// Apply one Kernel-Process ring record: row identity and lifetime.
@@ -315,6 +357,7 @@ pub const Core = struct {
                 if (!f.lingering) switch (f.proto) {
                     .tcp => dst.tcp_conns += 1,
                     .udp => dst.udp_socks += 1,
+                    .icmp => dst.icmp_flows += 1,
                 };
             }
             dst.flows = flat[start..fi];
@@ -379,6 +422,7 @@ fn testEventAt(
         .op = op,
         .proto = proto,
         .family = .v4,
+        .icmp_type = 0,
         .pid = pid,
         .size = size,
         .local_addr = [4]u8{ 192, 168, 1, 2 } ++ @as([12]u8, @splat(0)),
@@ -957,6 +1001,359 @@ test "process exit closes its live Flows into normal Linger" {
     const row2 = rowForPid(snap2.rows, 100).?;
     try std.testing.expectEqual(@as(usize, 0), row2.flows.len);
     try std.testing.expectEqual(@as(u64, 55), row2.sent);
+}
+
+// ---------------------------------------------------------------------------
+// ICMP (issue #27). Outbound messages arrive attributed by the event-header
+// PID; inbound ones arrive with no attribution at all (pid 0) and must be
+// correlated here or dropped.
+// ---------------------------------------------------------------------------
+
+const echo_request: u8 = 8;
+const echo_reply: u8 = 0;
+const echo_request6: u8 = 128;
+const echo_reply6: u8 = 129;
+const ttl_exceeded: u8 = 11;
+
+const host_a = [4]u8{ 1, 1, 1, 1 };
+const host_b = [4]u8{ 8, 8, 8, 8 };
+
+/// An outbound ICMP message from `pid`. The send path logs no addresses
+/// (ADR-0003), so there is deliberately no remote to pass.
+fn icmpSend(pid: u32, icmp_type: u8) event.NetEvent {
+    return icmpSendAt(pid, icmp_type, .v4, 0);
+}
+
+fn icmpSendAt(pid: u32, icmp_type: u8, family: event.Family, ts: i64) event.NetEvent {
+    return .{
+        .op = .send,
+        .proto = .icmp,
+        .family = family,
+        .icmp_type = icmp_type,
+        .pid = pid,
+        .size = 0,
+        .local_addr = @splat(0),
+        .remote_addr = @splat(0),
+        .local_port = 0,
+        .remote_port = 0,
+        .timestamp_ft = ts,
+    };
+}
+
+/// An inbound ICMP message: no PID, but a real peer address.
+fn icmpRecv(icmp_type: u8, remote: []const u8) event.NetEvent {
+    return icmpRecvFamily(icmp_type, .v4, remote);
+}
+
+fn icmpRecvFamily(icmp_type: u8, family: event.Family, remote: []const u8) event.NetEvent {
+    var ev = icmpSendAt(0, icmp_type, family, 0);
+    ev.op = .recv;
+    @memcpy(ev.remote_addr[0..remote.len], remote);
+    return ev;
+}
+
+test "a ping run is one ICMP Flow with request and reply message counts" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\PING.EXE"), 0);
+    // `ping -n 3 1.1.1.1`: three requests out, three replies back.
+    var t: u64 = 0;
+    while (t < 3) : (t += 1) {
+        try core.applyEvent(icmpSend(100, echo_request), t * 1000);
+        try core.applyEvent(icmpRecv(echo_reply, &host_a), t * 1000 + 5);
+    }
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    const f = row.flows[0];
+    try std.testing.expectEqual(event.Proto.icmp, f.proto);
+    try std.testing.expectEqual(@as(u64, 3), f.msgs_sent);
+    try std.testing.expectEqual(@as(u64, 3), f.msgs_recv);
+    try std.testing.expect(!f.lingering);
+    try std.testing.expectEqual(@as(u32, 1), row.icmp_flows);
+    // The peer is unknown on the send path; the replies name it.
+    try std.testing.expectEqualSlices(u8, &host_a, f.remote_addr[0..4]);
+    // ICMP contributes zero to every byte total, at both levels.
+    try std.testing.expectEqual(@as(u64, 0), f.sent + f.recv);
+    try std.testing.expectEqual(@as(u64, 0), row.sent + row.recv);
+}
+
+test "unsolicited inbound ICMP creates no Flow, no row, no activity anywhere" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // Nobody asked: an echo reply, a timestamp reply, and an inbound echo
+    // *request* (someone pinging us) all arrive out of nowhere.
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 0);
+    try core.applyEvent(icmpRecv(14, &host_a), 0);
+    try core.applyEvent(icmpRecv(echo_request, &host_a), 0);
+    try core.applyEvent(icmpRecvFamily(echo_reply6, .v6, &host_a), 0);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    // Not even a placeholder Process Row — System must gain nothing.
+    try std.testing.expectEqual(@as(usize, 0), snap.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), snap.flows.len);
+}
+
+test "a reply whose type pairs with nothing is dropped even mid-conversation" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    // What traceroute sees: the hop answers TTL-exceeded, not an echo reply.
+    // Pairing with nothing, it is the documented blind spot — dropped.
+    try core.applyEvent(icmpRecv(ttl_exceeded, &host_a), 10);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(u64, 1), row.flows[0].msgs_sent);
+    try std.testing.expectEqual(@as(u64, 0), row.flows[0].msgs_recv);
+    try std.testing.expectEqual(@as(usize, 1), snap.rows.len);
+}
+
+test "two concurrent pingers resolve replies to the most recent requester" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    try core.applyEvent(icmpSend(200, echo_request), 10);
+    // Event 1422 carries no echo Identifier, so the reply can only go to the
+    // most recent requester — the documented heuristic.
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 20);
+    // …and it moves with the next request.
+    try core.applyEvent(icmpSend(100, echo_request), 30);
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 40);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const first = rowForPid(snap.rows, 100).?;
+    const second = rowForPid(snap.rows, 200).?;
+    try std.testing.expectEqual(@as(u64, 2), first.flows[0].msgs_sent);
+    try std.testing.expectEqual(@as(u64, 1), first.flows[0].msgs_recv);
+    try std.testing.expectEqual(@as(u64, 1), second.flows[0].msgs_sent);
+    try std.testing.expectEqual(@as(u64, 1), second.flows[0].msgs_recv);
+    // Both pingers stay visible as their own Flows — no merging.
+    try std.testing.expectEqual(@as(u32, 1), first.icmp_flows);
+    try std.testing.expectEqual(@as(u32, 1), second.icmp_flows);
+}
+
+test "ICMPv6 echo pairs on its own type numbers, separately from v4" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // A v4 and a v6 ping from the same process are two Flows, and neither
+    // family's replies may land on the other.
+    try core.applyEvent(icmpSendAt(100, echo_request, .v4, 0), 0);
+    try core.applyEvent(icmpSendAt(100, echo_request6, .v6, 0), 0);
+    try core.applyEvent(icmpRecvFamily(echo_reply6, .v6, &.{}), 10);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try std.testing.expectEqual(@as(u32, 2), row.icmp_flows);
+    for (row.flows) |f| {
+        try std.testing.expectEqual(@as(u64, 1), f.msgs_sent);
+        const want: u64 = if (f.family == .v6) 1 else 0;
+        try std.testing.expectEqual(want, f.msgs_recv);
+    }
+}
+
+test "one process pinging two hosts is one ICMP Flow showing its latest peer" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // ICMP identity is (protocol, family, PID): the send path names no peer,
+    // so per-host Flows cannot exist (ADR-0003).
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 10);
+    try core.applyEvent(icmpSend(100, echo_request), 20);
+    try core.applyEvent(icmpRecv(echo_reply, &host_b), 30);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(usize, 1), row.flows.len);
+    try std.testing.expectEqual(@as(u64, 2), row.flows[0].msgs_recv);
+    try std.testing.expectEqualSlices(u8, &host_b, row.flows[0].remote_addr[0..4]);
+    // No local endpoint, no ports — the identity has none to show.
+    try std.testing.expectEqual(@as(u16, 0), row.flows[0].local_port);
+    try std.testing.expectEqual(@as(u16, 0), row.flows[0].remote_port);
+    try std.testing.expectEqualSlices(
+        u8,
+        &@as([16]u8, @splat(0)),
+        &row.flows[0].local_addr,
+    );
+}
+
+test "ICMP the kernel itself sends is System's Flow, not phantom activity" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // The stack originates ICMP of its own — errors, neighbor discovery, and
+    // the echo replies it sends when something pings this machine — and logs
+    // them in System's context. Observed live: a PID-4 Flow reading
+    // "1 sent / 0 recv" with no peer. That is a real outbound message, so it
+    // is shown; the rule that keeps System clean is about *inbound* messages,
+    // which carry no attribution and are dropped when unmatched.
+    try core.applyEvent(icmpSend(4, 3), 0); // destination unreachable
+    // …and nothing pairs with it, so no reply can ever land on it.
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 10);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    try std.testing.expectEqual(@as(usize, 1), snap.rows.len);
+    const row = rowForPid(snap.rows, 4).?;
+    try std.testing.expectEqual(@as(u64, 1), row.flows[0].msgs_sent);
+    try std.testing.expectEqual(@as(u64, 0), row.flows[0].msgs_recv);
+    try std.testing.expectEqual(@as(u64, 0), row.sent + row.recv);
+    // No peer: the send path names none (ADR-0003).
+    try std.testing.expectEqualSlices(
+        u8,
+        &@as([16]u8, @splat(0)),
+        &row.flows[0].remote_addr,
+    );
+}
+
+test "a send that does name its peer sets it without waiting for a reply" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // This session's keyword logs no send-path addresses, but 1809 may and
+    // the parser passes through whatever is there: an unanswered ping should
+    // then still show its target.
+    var ev = icmpSend(100, echo_request);
+    @memcpy(ev.remote_addr[0..4], &host_a);
+    try core.applyEvent(ev, 0);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const f = rowForPid(snap.rows, 100).?.flows[0];
+    try std.testing.expectEqual(@as(u64, 1), f.msgs_sent);
+    try std.testing.expectEqual(@as(u64, 0), f.msgs_recv);
+    try std.testing.expectEqualSlices(u8, &host_a, f.remote_addr[0..4]);
+}
+
+test "ICMP Flows age out after 30 s inactivity into normal Linger" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 5_000); // activity resets it
+
+    try core.tick(34_999);
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    try std.testing.expect(!rowForPid(snap.rows, 100).?.flows[0].lingering);
+
+    try core.tick(35_000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    const row2 = rowForPid(snap2.rows, 100).?;
+    try std.testing.expect(row2.flows[0].lingering);
+    try std.testing.expectEqual(@as(u32, 0), row2.icmp_flows);
+    // The counts stay readable while it Lingers.
+    try std.testing.expectEqual(@as(u64, 1), row2.flows[0].msgs_sent);
+    try std.testing.expectEqual(@as(u64, 1), row2.flows[0].msgs_recv);
+    try std.testing.expectEqualSlices(u8, &host_a, row2.flows[0].remote_addr[0..4]);
+
+    // …and 10 s later it leaves the list entirely.
+    try core.tick(45_000);
+    const snap3 = try core.buildSnapshot();
+    defer snap3.release();
+    try std.testing.expectEqual(@as(usize, 0), rowForPid(snap3.rows, 100).?.flows.len);
+}
+
+test "a reply arriving after its Flow ended is dropped, never revived" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    try core.tick(30_000); // aged out into Linger
+
+    // Lingering is not live: the late reply must not resurrect it.
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 30_100);
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u64, 0), row.flows[0].msgs_recv);
+
+    // Once the Linger window closes the slot is gone; still no revival.
+    try core.tick(41_000);
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 41_100);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    try std.testing.expectEqual(@as(usize, 0), rowForPid(snap2.rows, 100).?.flows.len);
+}
+
+test "the reconciliation sweep never closes an ICMP Flow" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    // ICMP has no IP Helper owner table, so an empty sweep says nothing about
+    // it — only the 30 s age-out ends an ICMP Flow.
+    try core.reconcile(&.{}, 5_000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expect(!row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u32, 1), row.icmp_flows);
+
+    // And a TCP sweep alongside it still does its own job.
+    const tcp = testEvent(.send, .tcp, 100, 10, 51000);
+    try core.applyEvent(tcp, 6_000);
+    try core.reconcile(&.{}, 7_000);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    const row2 = rowForPid(snap2.rows, 100).?;
+    try std.testing.expectEqual(@as(u32, 1), row2.icmp_flows);
+    try std.testing.expectEqual(@as(u32, 0), row2.tcp_conns);
+}
+
+test "a ping process exiting closes its ICMP Flow into normal Linger" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    // The common case: ping.exe exits seconds after its last reply.
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\PING.EXE"), 0);
+    try core.applyEvent(icmpSend(100, echo_request), 0);
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 10);
+    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""), 1_000);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expect(row.exited);
+    try std.testing.expect(row.flows[0].lingering);
+    try std.testing.expectEqual(@as(u32, 0), row.icmp_flows);
+    try std.testing.expectEqual(@as(u64, 1), row.flows[0].msgs_recv);
+
+    // A straggler reply after the exit has no live Flow to land on.
+    try core.applyEvent(icmpRecv(echo_reply, &host_a), 1_100);
+    const snap2 = try core.buildSnapshot();
+    defer snap2.release();
+    try std.testing.expectEqual(@as(u64, 1), rowForPid(snap2.rows, 100).?.flows[0].msgs_recv);
+}
+
+test "ICMP alongside TCP and UDP leaves byte totals untouched" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyEvent(testEvent(.send, .tcp, 100, 1500, 51000), 0);
+    try core.applyEvent(testEvent(.recv, .udp, 100, 40, 5353), 0);
+    var t: u64 = 0;
+    while (t < 50) : (t += 1) try core.applyEvent(icmpSend(100, echo_request), 0);
+
+    const snap = try core.buildSnapshot();
+    defer snap.release();
+    const row = rowForPid(snap.rows, 100).?;
+    try std.testing.expectEqual(@as(u64, 1500), row.sent);
+    try std.testing.expectEqual(@as(u64, 40), row.recv);
+    try std.testing.expectEqual(@as(u32, 1), row.icmp_flows);
+    // Every flow's bytes and messages stay in their own columns.
+    var bytes: u64 = 0;
+    var msgs: u64 = 0;
+    for (row.flows) |f| {
+        bytes += f.sent + f.recv;
+        msgs += f.msgs_sent + f.msgs_recv;
+    }
+    try std.testing.expectEqual(@as(u64, 1540), bytes);
+    try std.testing.expectEqual(@as(u64, 50), msgs);
 }
 
 test "a held Snapshot never changes while the Engine keeps updating" {

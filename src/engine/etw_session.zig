@@ -3,10 +3,10 @@
 //! Session configuration follows the v1 spec (issue #18, "Capture: TCP/UDP
 //! byte accounting") and docs/research/etw-tcp-udp-pipeline.md: QPC clock,
 //! real-time mode, 16 KB buffers, min/max buffers 2×/4× logical CPUs, 1 s
-//! FlushTimer. Kernel-Network and Kernel-Process both enable into this one
-//! session (docs/research/kernel-process-etw.md). A crash-orphaned session
-//! is self-healing: on ERROR_ALREADY_EXISTS the orphan is stopped by name
-//! and startup retried (ADR-0002).
+//! FlushTimer. Kernel-Network, Kernel-Process and TCPIP all enable into this
+//! one session (docs/research/kernel-process-etw.md, icmp-visibility.md). A
+//! crash-orphaned session is self-healing: on ERROR_ALREADY_EXISTS the orphan
+//! is stopped by name and startup retried (ADR-0002).
 
 const std = @import("std");
 const win32 = @import("win32");
@@ -52,6 +52,19 @@ pub const kernel_network_keyword_ipv6: u64 = 0x20;
 /// and stay off.
 pub const kernel_process_guid = win32.Guid.initString("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716");
 pub const kernel_process_keyword_process: u64 = 0x10;
+
+/// Microsoft-Windows-TCPIP manifest provider — the only user-mode source of
+/// per-process ICMP (docs/research/icmp-visibility.md §Verdict; issue #27).
+/// `ut:Global` is a state-change/diagnostic keyword, not a per-packet data
+/// path: it costs a one-time rundown burst when the provider is enabled
+/// (1155 events measured, dominated by IP neighbor rundown 1542) and then ~2
+/// events per ICMP message. The per-packet keywords next to it
+/// (`ut:SendPath`, `ut:TcpipDiagnosis`, …) stay off — measured at ~40x the
+/// event volume under load, which no budget here would survive.
+///
+/// Deliberately absent from `start`'s enable list: see `enableIcmp`.
+pub const tcpip_guid = win32.Guid.initString("2f07e2ee-15db-40f1-90ef-9d7ba282188a");
+pub const tcpip_keyword_global: u64 = 0x0000008000000000;
 
 pub const StartError = error{
     /// The controlling APIs require elevation; startup is fail-fast (ADR-0002).
@@ -103,6 +116,34 @@ pub const Session = struct {
         );
     }
 
+    /// Enable TCPIP for ICMP visibility (issue #27). Split out of `start`
+    /// and issued only once the consumer thread is draining, because
+    /// enabling this provider makes it dump its interface/address/route
+    /// state immediately — a 1155-event burst that would otherwise pile into
+    /// the session's real-time buffers with nothing attached to read them.
+    /// On a machine with few logical CPUs the buffer pool (2x-4x CPUs x
+    /// 16 KB) is smaller than that burst, so the session would report
+    /// EventsLost before monitoring even began and stick the "totals may
+    /// undercount" flag on at every launch. Same reasoning as the deferred
+    /// Kernel-Process rundown, different trigger: there it is CAPTURE_STATE,
+    /// here it is the enable itself.
+    ///
+    /// The cost is a sub-second window at startup where ICMP is not logged
+    /// at all. TCP/UDP keep the spec's cold-start ordering — enabled up
+    /// front so their events buffer behind the table snapshot.
+    pub fn enableIcmp(self: Session) bool {
+        return win32.EnableTraceEx2(
+            self.handle,
+            &tcpip_guid,
+            win32.EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+            win32.TRACE_LEVEL_INFORMATION,
+            tcpip_keyword_global,
+            0,
+            0,
+            null,
+        ) == .NO_ERROR;
+    }
+
     /// Cumulative events the session lost, both channels: EventsLost (buffer
     /// exhaustion at write time) plus RealTimeBuffersLost (buffers undeliverable
     /// to the real-time consumer). Null when the query itself fails. Any
@@ -116,9 +157,10 @@ pub const Session = struct {
     }
 };
 
-/// Start the `zPulsarNet` session and enable Kernel-Network (IPv4|IPv6) and
-/// Kernel-Process (keyword 0x10, level 4). On ERROR_ALREADY_EXISTS the
-/// orphaned session is stopped by name and the start retried once.
+/// Start the `zPulsarNet` session and enable Kernel-Network (IPv4|IPv6),
+/// Kernel-Process (keyword 0x10) and TCPIP (`ut:Global`), all at level 4. On
+/// ERROR_ALREADY_EXISTS the orphaned session is stopped by name and the start
+/// retried once.
 pub fn start(logical_cpus: u32) StartError!Session {
     return startWith(Win32Ops, logical_cpus);
 }
@@ -223,7 +265,7 @@ const Win32Ops = struct {
 };
 
 const TestOps = struct {
-    const Call = enum { start, stop_by_name, enable_network, enable_process };
+    const Call = enum { start, stop_by_name, enable_network, enable_process, enable_tcpip };
 
     var calls_buf: [8]Call = undefined;
     var calls_len: usize = 0;
@@ -231,9 +273,11 @@ const TestOps = struct {
     var stop_rc: win32.WIN32_ERROR = .NO_ERROR;
     var enable_network_rc: win32.WIN32_ERROR = .NO_ERROR;
     var enable_process_rc: win32.WIN32_ERROR = .NO_ERROR;
+    var enable_tcpip_rc: win32.WIN32_ERROR = .NO_ERROR;
     var starts_seen: usize = 0;
     var network_keywords: u64 = 0;
     var process_keywords: u64 = 0;
+    var tcpip_keywords: u64 = 0;
 
     fn record(call: Call) void {
         calls_buf[calls_len] = call;
@@ -250,9 +294,11 @@ const TestOps = struct {
         stop_rc = .NO_ERROR;
         enable_network_rc = .NO_ERROR;
         enable_process_rc = .NO_ERROR;
+        enable_tcpip_rc = .NO_ERROR;
         starts_seen = 0;
         network_keywords = 0;
         process_keywords = 0;
+        tcpip_keywords = 0;
     }
 
     fn startTrace(
@@ -290,18 +336,26 @@ const TestOps = struct {
             network_keywords = any_keywords;
             return enable_network_rc;
         }
-        std.debug.assert(std.mem.eql(u8, &provider.Bytes, &kernel_process_guid.Bytes));
-        record(.enable_process);
-        process_keywords = any_keywords;
-        return enable_process_rc;
+        if (std.mem.eql(u8, &provider.Bytes, &kernel_process_guid.Bytes)) {
+            record(.enable_process);
+            process_keywords = any_keywords;
+            return enable_process_rc;
+        }
+        std.debug.assert(std.mem.eql(u8, &provider.Bytes, &tcpip_guid.Bytes));
+        record(.enable_tcpip);
+        tcpip_keywords = any_keywords;
+        return enable_tcpip_rc;
     }
 };
 
-test "clean start enables Kernel-Network (IPv4|IPv6) and Kernel-Process (0x10)" {
+test "clean start enables Kernel-Network (IPv4|IPv6) and Kernel-Process (0x10) — never TCPIP" {
     TestOps.reset(&.{.NO_ERROR});
     const session = try startWith(TestOps, 4);
     try std.testing.expectEqual(@as(win32.CONTROLTRACE_HANDLE, 42), session.handle);
     try std.testing.expect(!session.adopted_orphan);
+    // TCPIP is absent on purpose: enabling it triggers a 1155-event rundown
+    // burst, so it waits until a consumer is draining (`enableIcmp`, issue
+    // #27). Moving it back into the enable list breaks this sequence.
     try std.testing.expectEqualSlices(
         TestOps.Call,
         &.{ .start, .enable_network, .enable_process },
@@ -309,6 +363,7 @@ test "clean start enables Kernel-Network (IPv4|IPv6) and Kernel-Process (0x10)" 
     );
     try std.testing.expectEqual(@as(u64, 0x10 | 0x20), TestOps.network_keywords);
     try std.testing.expectEqual(@as(u64, 0x10), TestOps.process_keywords);
+    try std.testing.expectEqual(@as(u64, 0), TestOps.tcpip_keywords);
 }
 
 test "already-exists: orphan stopped by name, then start retried" {
