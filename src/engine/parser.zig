@@ -137,6 +137,8 @@ pub fn parseV0(id: u16, user_data: []const u8, timestamp_ft: i64) ?NetEvent {
         .op = class.op,
         .proto = class.proto,
         .family = class.family,
+        // Kernel-Network never carries ICMP (research §5).
+        .icmp_type = 0,
         .pid = undefined,
         .size = undefined,
         .local_addr = @splat(0),

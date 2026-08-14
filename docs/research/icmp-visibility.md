@@ -220,10 +220,91 @@ separate path described above.
 ## Open items for implementation (empirical verification required)
 
 1. Confirm events 1422/1423/1424 exist in the Windows 10 1809 TCPIP manifest
-   and that send-path header-PID attribution holds there.
+   and that send-path header-PID attribution holds there. **Also confirm
+   whether 1809 logs send-path addresses under `ut:Global`** — see the
+   addendum below.
 2. Measure ETW delivery latency with zPulsar's chosen buffer configuration.
 3. If the WFP drop/allow layer is adopted: verify `appId` for `IcmpSendEcho`
    callers, measure net-event callback latency, and implement save/restore of
    the persistent `NET_EVENT_MATCH_ANY_KEYWORDS` engine option.
 4. Decide the UI contract for ICMP: message counts (recommended) vs estimated
-   bytes.
+   bytes. **Settled during the build: message counts** (issue #27).
+
+## Addendum: the send path logs no addresses under `ut:Global` (issue #27)
+
+Recorded during the build. §2's table lists SourceAddress/DestAddress as
+payload fields of event 1422, and the empirical capture above confirmed
+header-PID attribution — but it printed only PID, direction, and type, so the
+addresses themselves were never checked. They do not survive the check.
+
+*Empirical (elevated, Windows 11 build 26200, `logman` sessions on the
+provider, rendered via `Get-WinEvent`):* under keyword `ut:Global` alone, the
+**send** path logs both address lengths as zero, while the **receive** path
+carries both in full:
+
+```
+dir=0 (send)     ICMP: Sendmessage. Type = Echo Request, Code = 0,
+                 CompartmentId = 0, SourceAddress = , DestAddress =
+                   SourceAddressLength = 0    DestAddressLength = 0
+
+dir=1 (receive)  ICMP: Receivemessage. Type = Echo Reply, ...
+                   SourceAddressLength = 16   SourceAddress = 02000000 01010101 …
+                   DestAddressLength  = 16    DestAddress   = 02000000 C0A858FE …
+```
+
+So the only attributable direction is the only address-less one. The
+`SOCKADDR` blobs are ordinary `SOCKADDR_IN` (16 bytes) and `SOCKADDR_IN6`
+(28 bytes); the receive path's SourceAddress is the peer.
+
+Raw `EVENT_RECORD.UserData` for the same events, dumped from a live
+`zPulsarNet` consumer during `ping -n 2 1.1.1.1` and `ping -6 -n 2 ::1` —
+these are the parser fixtures in `src/engine/icmp_parser.zig`:
+
+```
+send v4  pid=60732 len=28
+  01000000 00000000 08000000 00000000 00000000 00000000 00000000
+  proto=1  dir=0    type=8   code=0   compart=0 srcLen=0 dstLen=0
+
+recv v4  pid=4     len=60
+  01000000 01000000 00000000 00000000 01000000
+  10000000 02000000 01010101 0000000000000000     src = 1.1.1.1
+  10000000 02000000 c0a858fe 0000000000000000     dst = 192.168.88.254
+
+send v6  pid=54176 len=28
+  3a000000 00000000 80000000 00000000 00000000 00000000 00000000
+  proto=58 dir=0    type=128 (echo request, RFC 4443)
+```
+
+Note the send path's `CompartmentId = 0` against the receive path's `1` — the
+two directions are logged from different call sites, which is consistent with
+only one of them knowing the addresses.
+
+**One keyword bit changes this: `ut:TcpipDiagnosis` (0x80)**, found by
+bisecting the provider's 64-bit keyword space (`ut:SendPath`, `ut:PiiPresent`,
+`ut:Packet`, `ut:Address`, `ut:ProcessIdHint`, `ut:TcpipRoute`,
+`ut:AleRemoteEndpoint` were each ruled out individually). With it enabled the
+send path logs full addresses and `CompartmentId = 1`. It is unaffordable —
+it is a per-packet keyword:
+
+| Session keywords | startup burst | events during a 20 MB download |
+|---|---|---|
+| `ut:Global` | 1155 | 300 |
+| `ut:Global \| ut:TcpipDiagnosis` | 2144 | 12,433 (id 1454 ×10,629) |
+
+**Consequence:** ICMP Flow identity drops the remote address — see ADR-0003.
+
+Two send-path events *do* carry the destination in the calling process's own
+context, at affordable volume, if per-host ICMP Flows are ever wanted back:
+
+- **1370 `RouteLookup`** (`ut:TcpipRoute`, 0x20) — `DestinationAddress` plus
+  the outgoing interface and next hop. Observed in `ping.exe`'s context, but
+  only at level 5; at level 4 it did not fire.
+- **1466 `WFP-ALE: RemoteEndPoint Insertion`** (`ut:AleRemoteEndpoint`,
+  0x8000) — `LocalAddress` and `RemoteAddress`, in `ping.exe`'s context at
+  level 4, ~225 events per 20 MB download. Fires per ALE remote-endpoint
+  insertion (once per conversation), not per message, and is not
+  ICMP-specific: it has no ICMP type field and its rendered port
+  (`remote=1.1.1.1:1`) does not obviously encode one.
+
+Both would mean synthesizing one Flow from two correlated event streams of
+undocumented behavior; neither was adopted for v1.

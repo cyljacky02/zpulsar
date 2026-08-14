@@ -6,20 +6,29 @@
 
 const std = @import("std");
 
-pub const Proto = enum(u8) { tcp, udp };
+pub const Proto = enum(u8) { tcp, udp, icmp };
 pub const Family = enum(u8) { v4, v6 };
 
 /// What the Engine does with the record: send/recv accumulate In-session
 /// Totals; connect/disconnect maintain the connection list. Events excluded
 /// from totals (retransmit, protocol copy) never become records at all.
+/// ICMP uses send/recv only — it has no lifecycle events.
 pub const Op = enum(u8) { send, recv, connect, disconnect };
 
 pub const NetEvent = struct {
     op: Op,
     proto: Proto,
     family: Family,
+    /// ICMP only: the message's type number, which decides which outbound
+    /// request an inbound reply pairs with (flows.zig). Zero otherwise —
+    /// stated explicitly like every other field, so a new parser cannot
+    /// forget it exists.
+    icmp_type: u8,
     pid: u32,
-    /// Bytes of the transport operation; 0 for lifecycle events.
+    /// Bytes of the transport operation; 0 for lifecycle events, and always
+    /// 0 for ICMP — no user-mode source reports ICMP message sizes
+    /// (docs/research/icmp-visibility.md §Verdict), so ICMP Flows count
+    /// messages instead and contribute nothing to any byte total.
     size: u32,
     /// Raw network-order bytes; v4 occupies the first 4 bytes, rest zero.
     local_addr: [16]u8,
@@ -185,6 +194,7 @@ fn testEvent(proto: Proto) NetEvent {
         .op = .send,
         .proto = proto,
         .family = .v4,
+        .icmp_type = 0,
         .pid = 1234,
         .size = 100,
         .local_addr = [4]u8{ 192, 168, 1, 2 } ++ @as([12]u8, @splat(0)),
