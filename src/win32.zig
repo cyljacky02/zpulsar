@@ -147,6 +147,15 @@ pub const Sleep = zigwin32.kernel32.Sleep;
 /// behind std.Io, so tick pacing uses the OS directly.
 pub const GetTickCount64 = zigwin32.kernel32.GetTickCount64;
 
+/// Wall clock as a flat FILETIME tick count (100 ns since 1601) — the domain
+/// ETW stamps every event header in. Captured once beside `GetTickCount64`
+/// to anchor event time against the Engine's monotonic clock.
+pub fn systemTimeAsFileTime() u64 {
+    var ft: foundation.FILETIME = undefined;
+    zigwin32.kernel32.GetSystemTimeAsFileTime(&ft);
+    return (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
 pub const GetStdHandle = zigwin32.kernel32.GetStdHandle;
 pub const STD_ERROR_HANDLE = zigwin32.system.console.STD_ERROR_HANDLE;
 /// consoleapi.h output-mode bit. Upstream's CONSOLE_MODE packed struct
