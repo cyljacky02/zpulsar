@@ -1,4 +1,5 @@
-//! The Ledger's row order.
+//! The Ledger's order, at both of the levels that have one: the Programs, and
+//! the instances within each of them.
 //!
 //! Sorting a live table by a live number is a trap the UI prototype walked
 //! into: rows swap places while speeds jitter, and a click resolves against
@@ -6,14 +7,16 @@
 //! *frozen* — recomputed on a 1.5 s beat, and held between beats while the
 //! numbers inside the rows keep moving.
 //!
-//! Holding an order across Snapshots needs a name for "the same row as last
-//! time", and that name is the engine's own row key (pid, CreateTime) — see
-//! `snapshot.Row.create_time`. Rows are addressed by index into the Snapshot,
-//! so nothing here outlives the Snapshot the caller is holding.
+//! Holding an order across Snapshots needs a name for "the same thing as last
+//! time". For an instance that is the engine's own row key (pid, CreateTime) —
+//! see `snapshot.Row.create_time`; for a Program it is the identity hash its
+//! instances grouped by (programs.zig). Everything is addressed by index into
+//! the Snapshot, so nothing here outlives the one the caller is holding.
 
 const std = @import("std");
 const engine = @import("engine");
 const format = @import("format.zig");
+const programs = @import("programs.zig");
 
 const snapshot = engine.snapshot;
 
@@ -46,18 +49,22 @@ fn keyOrder(a: snapshot.Row, b: snapshot.Row) bool {
 pub const Ordering = struct {
     field: Field = .down,
     direction: Direction = .descending,
-    /// Where each row sat at the last re-sort. This is what freezes the
-    /// display: between beats the rows are sorted by these, not by their
-    /// (still moving) values.
+    /// Where each Program sat at the last re-sort, by identity hash
+    /// (programs.zig). The Ledger's top level is Programs, so this is the one
+    /// that decides what the reader is looking at.
+    program_ranks: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Where each row sat at the last re-sort, within its own Program. This
+    /// is what freezes the display: between beats things are sorted by these,
+    /// not by their (still moving) values.
     ranks: std.AutoHashMapUnmanaged(Key, u32) = .empty,
     /// Null until the first sort — the first frame is sorted, not left in
     /// whatever order the Snapshot happened to arrive in.
     last_resort_ms: ?u64 = null,
-    /// Reused across frames: the display order, as indices into the
-    /// Snapshot's rows.
+    /// Reused across frames: the display order, as indices into the Programs.
     order: std.ArrayList(u32) = .empty,
 
     pub fn deinit(self: *Ordering, gpa: std.mem.Allocator) void {
+        self.program_ranks.deinit(gpa);
         self.ranks.deinit(gpa);
         self.order.deinit(gpa);
     }
@@ -71,31 +78,69 @@ pub const Ordering = struct {
         self.last_resort_ms = null;
     }
 
-    /// The rows in display order, as indices into `rows`. Cheap enough to call
-    /// every frame and stable when it is: between beats this only re-applies
-    /// the frozen ranks, so the answer does not change while the values do.
+    /// The Programs in display order, as indices into `list`, with each
+    /// Program's members sorted in place. Cheap enough to call every frame and
+    /// stable when it is: between beats this only re-applies the frozen ranks,
+    /// so the answer does not change while the values do.
+    ///
+    /// Both levels move on the same beat. Re-sorting them on separate clocks
+    /// would have a Program hold still while its instances shuffled inside it,
+    /// which is the same lie the frozen order exists to prevent.
     pub fn display(
         self: *Ordering,
         gpa: std.mem.Allocator,
+        list: []programs.Program,
         rows: []const snapshot.Row,
         now_ms: u64,
     ) []const u32 {
-        const buf = self.fill(gpa, rows.len);
-        if (self.due(now_ms)) {
+        const buf = self.fill(gpa, list.len);
+        const resorting = self.due(now_ms);
+        if (resorting) {
             self.last_resort_ms = now_ms;
-            std.mem.sortUnstable(u32, buf, FieldSort{
+            // Every Program re-ranks its own members into this map below; it
+            // is emptied once, here, so ranks from rows that have since gone
+            // do not outlive the beat.
+            self.ranks.clearRetainingCapacity();
+            std.mem.sortUnstable(u32, buf, ProgramSort{
+                .list = list,
+                .rows = rows,
+                .field = self.field,
+                .direction = self.direction,
+            }, ProgramSort.lessThan);
+            self.recordProgramRanks(gpa, list, buf);
+        } else {
+            std.mem.sortUnstable(u32, buf, ProgramRankSort{
+                .list = list,
+                .rows = rows,
+                .ranks = &self.program_ranks,
+            }, ProgramRankSort.lessThan);
+        }
+
+        for (list) |p| self.sortMembers(gpa, p.members, rows, resorting);
+        return buf;
+    }
+
+    /// One Program's instances, on the same beat as the Programs themselves.
+    fn sortMembers(
+        self: *Ordering,
+        gpa: std.mem.Allocator,
+        members: []u32,
+        rows: []const snapshot.Row,
+        resorting: bool,
+    ) void {
+        if (resorting) {
+            std.mem.sortUnstable(u32, members, FieldSort{
                 .rows = rows,
                 .field = self.field,
                 .direction = self.direction,
             }, FieldSort.lessThan);
-            self.recordRanks(gpa, rows, buf);
+            self.recordRanks(gpa, rows, members);
         } else {
-            std.mem.sortUnstable(u32, buf, RankSort{
+            std.mem.sortUnstable(u32, members, RankSort{
                 .rows = rows,
                 .ranks = &self.ranks,
             }, RankSort.lessThan);
         }
-        return buf;
     }
 
     fn due(self: Ordering, now_ms: u64) bool {
@@ -116,19 +161,92 @@ pub const Ordering = struct {
         return self.order.items;
     }
 
-    /// Freeze the order just computed. All or nothing: a half-written map
-    /// would mix two orderings, so on memory pressure the previous one stands
-    /// and the next beat tries again.
+    /// Freeze the Program order just computed.
+    fn recordProgramRanks(
+        self: *Ordering,
+        gpa: std.mem.Allocator,
+        list: []const programs.Program,
+        order: []const u32,
+    ) void {
+        self.program_ranks.ensureTotalCapacity(gpa, @intCast(order.len)) catch return;
+        self.program_ranks.clearRetainingCapacity();
+        for (order, 0..) |at, place|
+            self.program_ranks.putAssumeCapacity(list[at].key, @intCast(place));
+    }
+
+    /// Freeze one Program's member order. Ranks are per Program but share one
+    /// map — a row belongs to exactly one Program, so its key appears once.
+    /// The map is emptied once at the top of the beat, in `display`, rather
+    /// than here: emptying it per Program would wipe the one before.
     fn recordRanks(
         self: *Ordering,
         gpa: std.mem.Allocator,
         rows: []const snapshot.Row,
         order: []const u32,
     ) void {
-        self.ranks.ensureTotalCapacity(gpa, @intCast(order.len)) catch return;
-        self.ranks.clearRetainingCapacity();
+        // On memory pressure this Program's rows go unranked for the beat and
+        // sort to the bottom of their own Program, where a newcomer sits; the
+        // next beat tries again. Only this Program is affected — the ones
+        // already recorded keep the places they were just given.
+        self.ranks.ensureUnusedCapacity(gpa, @intCast(order.len)) catch return;
         for (order, 0..) |row_idx, place|
             self.ranks.putAssumeCapacity(keyOf(rows[row_idx]), @intCast(place));
+    }
+};
+
+/// The beat, at the top level: sort Programs by what their row actually
+/// shows, which is the sum of their instances — not the busiest one of them.
+/// A Program running eight quiet instances is busier than one running a single
+/// middling one, and the number on the row says so.
+const ProgramSort = struct {
+    list: []const programs.Program,
+    rows: []const snapshot.Row,
+    field: Field,
+    direction: Direction,
+
+    fn lessThan(self: ProgramSort, a: u32, b: u32) bool {
+        const pa = self.list[a];
+        const pb = self.list[b];
+        return switch (self.compare(pa, pb)) {
+            .lt => self.direction == .ascending,
+            .gt => self.direction == .descending,
+            // Ties fall to the row the Program is named by, so the same
+            // Programs always come out the same way.
+            .eq => keyOrder(self.rows[pa.represents], self.rows[pb.represents]),
+        };
+    }
+
+    fn compare(self: ProgramSort, a: programs.Program, b: programs.Program) std.math.Order {
+        return switch (self.field) {
+            .name => std.ascii.orderIgnoreCase(
+                format.processName(self.rows[a.represents].name),
+                format.processName(self.rows[b.represents].name),
+            ),
+            .down => std.math.order(a.recv_rate, b.recv_rate),
+            .up => std.math.order(a.sent_rate, b.sent_rate),
+            .down_total => format.compareVolume(programs.volume(a, .down), programs.volume(b, .down)),
+            .up_total => format.compareVolume(programs.volume(a, .up), programs.volume(b, .up)),
+        };
+    }
+};
+
+/// Between beats, at the top level: sort Programs by where they already were.
+const ProgramRankSort = struct {
+    list: []const programs.Program,
+    rows: []const snapshot.Row,
+    ranks: *const std.AutoHashMapUnmanaged(u64, u32),
+
+    fn lessThan(self: ProgramRankSort, a: u32, b: u32) bool {
+        const ra = self.rank(self.list[a]);
+        const rb = self.rank(self.list[b]);
+        if (ra != rb) return ra < rb;
+        return keyOrder(self.rows[self.list[a].represents], self.rows[self.list[b].represents]);
+    }
+
+    /// Where this Program sat at the last beat, or the bottom — which is where
+    /// a Program that has only just started belongs until a beat places it.
+    fn rank(self: ProgramRankSort, p: programs.Program) u32 {
+        return self.ranks.get(p.key) orelse std.math.maxInt(u32);
     }
 };
 
@@ -186,17 +304,13 @@ const RankSort = struct {
 
     /// Where this row sat at the last beat, or the bottom — which is where a
     /// newcomer belongs until a beat places it properly.
+    ///
+    /// A row whose identity arrives is not a case here: it changes Program at
+    /// the same moment (programs.zig keys a placeholder by its row key), so it
+    /// is the *Program* that is new, and `ProgramRankSort` is where that
+    /// lands.
     fn rank(self: RankSort, row: snapshot.Row) u32 {
-        if (self.ranks.get(keyOf(row))) |place| return place;
-        // A row whose identity arrived since the last beat: the Engine adopts
-        // a placeholder *in place*, totals kept (core.zig), so this is the
-        // same Process Row that was ranked under its half-known key — not a
-        // new one. Following it costs one extra lookup and saves a row
-        // visibly falling to the bottom the moment it learns its own name.
-        if (row.create_time != 0) {
-            if (self.ranks.get(.{ .pid = row.pid, .create_time = 0 })) |place| return place;
-        }
-        return std.math.maxInt(u32);
+        return self.ranks.get(keyOf(row)) orelse std.math.maxInt(u32);
     }
 };
 
@@ -214,13 +328,33 @@ fn expectPermutation(order: []const u32, row_count: usize) !void {
     }
 }
 
-/// The display, as the exe names it puts on screen, top first.
+/// The display, as the exe names it puts on screen, top first — one name per
+/// Program, which is what the Ledger's top level lists. Rows that share an
+/// identity are one entry; every test row below has a name of its own unless
+/// it is testing the grouping itself.
+///
+/// The Programs are built and dropped inside this call: the names it returns
+/// are the caller's rows, not the grouping's.
 fn names(gpa: std.mem.Allocator, o: *Ordering, rows: []const snapshot.Row, now_ms: u64) ![]const []const u8 {
-    const order = o.display(gpa, rows, now_ms);
-    try expectPermutation(order, rows.len);
+    var grouped: programs.Programs = .{};
+    defer grouped.deinit(gpa);
+    const list = grouped.build(gpa, rows);
+
+    const order = o.display(gpa, list, rows, now_ms);
+    try expectPermutation(order, list.len);
     const out = try gpa.alloc([]const u8, order.len);
-    for (order, out) |row_idx, *dst| dst.* = format.processName(rows[row_idx].name);
+    for (order, out) |at, *dst| dst.* = format.processName(rows[list[at].represents].name);
     return out;
+}
+
+/// The instances of one Program, in the order they sit under it.
+fn instances(gpa: std.mem.Allocator, o: *Ordering, rows: []const snapshot.Row, now_ms: u64) ![]const u32 {
+    var grouped: programs.Programs = .{};
+    defer grouped.deinit(gpa);
+    const list = grouped.build(gpa, rows);
+    _ = o.display(gpa, list, rows, now_ms);
+    try testing.expectEqual(@as(usize, 1), list.len);
+    return gpa.dupe(u32, list[0].members);
 }
 
 fn expectOrder(expected: []const []const u8, actual: []const []const u8) !void {
@@ -293,6 +427,51 @@ test "clicking a column re-sorts at once, not at the next beat" {
     const by_name = try names(testing.allocator, &o, &rows, 3);
     defer testing.allocator.free(by_name);
     try expectOrder(&.{ "a.exe", "b.exe" }, by_name);
+}
+
+test "a Program is ranked by its instances together, not by its busiest one" {
+    var o: Ordering = .{};
+    defer o.deinit(testing.allocator);
+    // Three quiet instances of one program against a single middling process.
+    // Ranking a Program by its busiest member would put `one.exe` on top,
+    // while the row beside it reads 300 against 250 — a column has to order
+    // what it shows (format.compareVolume, issue #28).
+    const rows = [_]snapshot.Row{
+        .{ .pid = 1, .create_time = 1, .name = "C:\\many.exe", .recv_rate = 100 },
+        .{ .pid = 2, .create_time = 2, .name = "C:\\one.exe", .recv_rate = 250 },
+        .{ .pid = 3, .create_time = 3, .name = "C:\\many.exe", .recv_rate = 100 },
+        .{ .pid = 4, .create_time = 4, .name = "C:\\many.exe", .recv_rate = 100 },
+    };
+
+    const shown = try names(testing.allocator, &o, &rows, 0);
+    defer testing.allocator.free(shown);
+    try expectOrder(&.{ "many.exe", "one.exe" }, shown);
+}
+
+test "instances hold their order under their Program, and move on the beat" {
+    var o: Ordering = .{};
+    defer o.deinit(testing.allocator);
+    var rows = [_]snapshot.Row{
+        .{ .pid = 1, .create_time = 1, .name = "C:\\a.exe", .recv_rate = 100 },
+        .{ .pid = 2, .create_time = 2, .name = "C:\\a.exe", .recv_rate = 50 },
+    };
+
+    const first = try instances(testing.allocator, &o, &rows, 0);
+    defer testing.allocator.free(first);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, first);
+
+    // The second instance overtakes the first. Instances freeze on the same
+    // beat as the Programs above them — a Program holding still while its own
+    // rows shuffled inside it would be the same lie, one level down.
+    rows[0].recv_rate = 10;
+    rows[1].recv_rate = 900;
+    const frozen = try instances(testing.allocator, &o, &rows, 100);
+    defer testing.allocator.free(frozen);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, frozen);
+
+    const beat = try instances(testing.allocator, &o, &rows, resort_interval_ms);
+    defer testing.allocator.free(beat);
+    try testing.expectEqualSlices(u32, &.{ 1, 0 }, beat);
 }
 
 test "a totals column ranks messages among the rows that moved no bytes" {
@@ -401,11 +580,12 @@ test "two instances of a reused PID hold separate places" {
     try expectOrder(&.{ "new.exe", "old.exe" }, frozen);
 }
 
-test "a row keeps its place when its identity finally arrives" {
+test "a row joins its Program when its identity finally arrives" {
     var o: Ordering = .{};
     defer o.deinit(testing.allocator);
     // A placeholder: traffic reached the Engine before the process rundown
-    // named it, so its half of the row key is still zero (snapshot.Row).
+    // named it, so its half of the row key is still zero (snapshot.Row). With
+    // no identity it shares a Program with nobody (programs.zig).
     var rows = [_]snapshot.Row{
         .{ .pid = 1, .create_time = 1, .name = "C:\\a.exe", .recv_rate = 300 },
         .{ .pid = 2, .create_time = 0, .name = "", .recv_rate = 200 },
@@ -415,14 +595,20 @@ test "a row keeps its place when its identity finally arrives" {
     defer testing.allocator.free(first);
     try expectOrder(&.{ "a.exe", format.unnamed, "c.exe" }, first);
 
-    // The identity lands and the Engine adopts the placeholder in place —
-    // same row, same totals, new key. It must not read as a new row and drop
-    // to the bottom; that would be a reorder nobody asked for.
+    // The identity lands and the Engine adopts the placeholder in place: same
+    // row, same totals — but a *different* Program, because it now shares an
+    // identity it did not have before. So it arrives as a newcomer and waits
+    // at the bottom, like any Program the beat has not placed yet...
     rows[1].create_time = 777;
     rows[1].name = "C:\\b.exe";
     const adopted = try names(testing.allocator, &o, &rows, 100);
     defer testing.allocator.free(adopted);
-    try expectOrder(&.{ "a.exe", "b.exe", "c.exe" }, adopted);
+    try expectOrder(&.{ "a.exe", "c.exe", "b.exe" }, adopted);
+
+    // ...and the next beat puts it where its traffic says it belongs.
+    const beat = try names(testing.allocator, &o, &rows, resort_interval_ms);
+    defer testing.allocator.free(beat);
+    try expectOrder(&.{ "a.exe", "b.exe", "c.exe" }, beat);
 }
 
 test "equal values still order the same way every frame" {

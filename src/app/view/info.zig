@@ -11,6 +11,7 @@
 const std = @import("std");
 const engine = @import("engine");
 const format = @import("format.zig");
+const programs = @import("programs.zig");
 
 const snapshot = engine.snapshot;
 
@@ -76,6 +77,29 @@ pub const flow_tools = [_][]const u8{ "Traceroute", "MTR", "WHOIS", "Copy remote
 /// What the reserved entries say for themselves, so nobody reads them as
 /// broken buttons.
 pub const tools_note = "extension points (v2+)";
+
+/// A Program's properties: what it is, and how much of it is running. It has
+/// no PID of its own — it is not one process — and no single exit state, so
+/// neither is offered here.
+pub fn programProperties(out: *Fields, p: programs.Program, r: snapshot.Row) void {
+    var buf: [32]u8 = undefined;
+    out.add("Name", format.processName(r.name), r.name.len == 0);
+    // A Program that grouped by its service is named by that service
+    // (programs.zig), so it is the identity, not a detail of one instance.
+    if (r.services.len == 1) out.add("Service", r.services[0], false);
+    // The Evicted-processes Row is where attribution stops (CONTEXT.md): its
+    // name is a label, not a path, and offering a path would invite the Tools
+    // section to open a folder that does not exist.
+    if (r.name.len > 0 and !r.evicted_processes) out.add("Path", r.name, false);
+    out.add("Instances", std.fmt.bufPrint(&buf, "{d}", .{p.members.len}) catch format.unnamed, false);
+    out.add("Flows", std.fmt.bufPrint(&buf, "{d}", .{p.flows}) catch format.unnamed, false);
+}
+
+/// A Program's activity: every instance of it, added up.
+pub fn programActivity(out: *Fields, p: programs.Program) void {
+    addRates(out, p.recv_rate, p.sent_rate);
+    addTotals(out, programs.volume(p, .down), programs.volume(p, .up));
+}
 
 /// A Process Row's properties: what it is, where it lives, and how much of
 /// the machine's network it is holding open.
@@ -350,6 +374,67 @@ test "an ICMP Flow's activity is messages, and it has no speed to report" {
         .{ .label = "Down session", .value = "3 msgs" },
         .{ .label = "Up session", .value = "4 msgs" },
     }, &fields);
+}
+
+test "a selected Program reads out what it is, and how many of it are running" {
+    const row: snapshot.Row = .{
+        .pid = 21700,
+        .create_time = 1,
+        .name = "C:\\Users\\bread\\AppData\\Local\\Programs\\electerm\\electerm.exe",
+    };
+    var props: Fields = .{};
+    var members = [_]u32{ 0, 1, 2 };
+    programProperties(&props, .{
+        .key = 0,
+        .represents = 0,
+        .members = &members,
+        .flows = 7,
+    }, row);
+    try expectFields(&.{
+        .{ .label = "Name", .value = "electerm.exe" },
+        // No PID: a Program is not one process, and picking one of its
+        // instances' PIDs to show would be a lie about which.
+        .{ .label = "Path", .value = "C:\\Users\\bread\\AppData\\Local\\Programs\\electerm\\electerm.exe" },
+        .{ .label = "Instances", .value = "3" },
+        .{ .label = "Flows", .value = "7" },
+    }, &props);
+}
+
+test "a Program that is a service is named by it" {
+    // CONTEXT.md "Process Row": one hosted service means the row *is* that
+    // service — and that is what it grouped by (programs.zig), so the Program
+    // is that service too.
+    const row: snapshot.Row = .{
+        .pid = 2260,
+        .name = "C:\\Windows\\System32\\svchost.exe",
+        .services = &.{"Dnscache"},
+    };
+    var props: Fields = .{};
+    var members = [_]u32{0};
+    programProperties(&props, .{ .key = 0, .represents = 0, .members = &members }, row);
+    const items = props.slice();
+    try testing.expectEqualStrings("Service", items[1].label);
+    try testing.expectEqualStrings("Dnscache", props.value(items[1]));
+}
+
+test "a Program's activity is its instances' together" {
+    var act: Fields = .{};
+    var members = [_]u32{ 0, 1 };
+    programActivity(&act, .{
+        .key = 0,
+        .represents = 0,
+        .members = &members,
+        .recv_rate = 29_850,
+        .sent_rate = 30_900,
+        .recv = 212_500_000,
+        .sent = 1_800_000,
+    });
+    try expectFields(&.{
+        .{ .label = "Down rate", .value = "29.9 KB/s" },
+        .{ .label = "Up rate", .value = "30.9 KB/s" },
+        .{ .label = "Down session", .value = "212.5 MB" },
+        .{ .label = "Up session", .value = "1.8 MB" },
+    }, &act);
 }
 
 test "a selected process reads out what it is, and what it has moved" {
