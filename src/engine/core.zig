@@ -1669,6 +1669,38 @@ test "a group Flow covers its bound socket, so the sweep seeds no duplicate" {
     try std.testing.expectEqual(event.GroupKind.multicast, f.group_kind);
 }
 
+test "a directed broadcast supersedes its wildcard-bound socket's placeholder" {
+    // Found on the rig, not in a test: a directed broadcast resolves its local
+    // side to the interface address, so looking the placeholder up by that
+    // address misses the `0.0.0.0` one the socket actually registered, and
+    // Spotify showed `0.0.0.0:57621 -> *` sitting beside its own conversation.
+    // Multicast never had the problem — its local side is already zero — which
+    // is exactly why the multicast test above passed while this was broken.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const bound: event.ConnKey = .{
+        .proto = .udp,
+        .family = .v4,
+        .local_addr = @splat(0),
+        .remote_addr = @splat(0),
+        .local_port = 57621,
+        .remote_port = 0,
+    };
+    try core.reconcile(&.{.{ .pid = 5136, .key = bound }}, 0);
+    try core.applyEvent(
+        udpEvent(.recv, 5136, ip4(192, 168, 88, 255), ip4(192, 168, 88, 254), 57621),
+        0,
+    );
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const f = onlyFlow(snap, 5136);
+    try std.testing.expectEqual(event.GroupKind.broadcast, f.group_kind);
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 254), &f.local_addr);
+}
+
 test "a specifically-bound socket shows the extra row ADR-0004 accepts" {
     // The other side of the under-claim above. presenceTuple cannot know which
     // address the socket bound, so a socket bound to a concrete address has

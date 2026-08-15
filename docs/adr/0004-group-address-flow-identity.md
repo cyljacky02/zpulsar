@@ -112,7 +112,11 @@ free, exactly as it inherits orientation today, so the two parse paths cannot di
   always zeroes a group Flow's local address, so `reconcile` sees such a socket's table row as
   uncovered and seeds it as a zero-remote placeholder alongside the group Flow. This is a
   deliberate under-claim: the extra row is a real bound socket, whereas claiming coverage of an
-  endpoint the Flow may not own could mask a socket nothing else is monitoring.
+  endpoint the Flow may not own could mask a socket nothing else is monitoring. A **wildcard**
+  bind — the common case, and the one in #41's repro — is unaffected: the placeholder lookup and
+  the sweep both reduce through `presenceTuple`, so they agree about which socket a group Flow
+  belongs to and the Flow supersedes its own placeholder as any other conversation would.
+  Verified on the rig against Spotify (PID 5136) bound `0.0.0.0:57621`.
 - **Two Groups of the same kind, same ports, same peer, merge**, and the displayed address is
   whichever arrived last. `group_kind` separates group traffic from unicast, not one group from
   another.

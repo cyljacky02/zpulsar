@@ -440,11 +440,14 @@ pub const Table = struct {
         now_ms: u64,
     ) error{OutOfMemory}!void {
         var placeholder = key;
-        placeholder.tuple.remote_addr = @splat(0);
-        placeholder.tuple.remote_port = 0;
-        // A table-seeded placeholder is never group-addressed: the owner
-        // tables describe binds, not arriving datagrams.
-        placeholder.tuple.group_kind = .none;
+        // The placeholder is this Flow reduced to owner-table granularity —
+        // the same reduction the sweep compares against, so the two cannot
+        // disagree about which socket a Flow belongs to. It matters for a
+        // group Flow: a directed broadcast's local side is the interface it
+        // arrived on, while the socket that gets the datagram is usually bound
+        // to the wildcard, and looking up the resolved address would leave the
+        // real socket's placeholder sitting beside its own conversation.
+        placeholder.tuple = presenceTuple(key.tuple);
         const slot = self.slots.getPtr(placeholder) orelse return;
         if (slot.live == null) return;
         if (slot.live.?.sent + slot.live.?.recv > 0) {
