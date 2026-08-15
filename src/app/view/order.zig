@@ -17,9 +17,11 @@ const format = @import("format.zig");
 
 const snapshot = engine.snapshot;
 
-/// The sortable columns (spec issue #24: Process, PID, Down, Up, Down total,
-/// Up total).
-pub const Field = enum { name, pid, down, up, down_total, up_total };
+/// The sortable columns. Every column of the Ledger but PID, which the layout
+/// lock (issue #10) leaves unsortable on purpose: a table ordered by PID is
+/// ordered by process start time, which answers no question this window is
+/// asked.
+pub const Field = enum { name, down, up, down_total, up_total };
 pub const Direction = enum { ascending, descending };
 
 /// The beat the order is recomputed on. The spec allows 1–2 s; the middle of
@@ -153,11 +155,19 @@ const FieldSort = struct {
                 format.processName(a.name),
                 format.processName(b.name),
             ),
-            .pid => std.math.order(a.pid, b.pid),
             .down => std.math.order(a.recv_rate, b.recv_rate),
             .up => std.math.order(a.sent_rate, b.sent_rate),
-            .down_total => std.math.order(a.recv, b.recv),
-            .up_total => std.math.order(a.sent, b.sent),
+            // By what the cell says here too: a totals cell shows bytes, or
+            // ICMP messages when messages are all the row moved, and the
+            // column has to rank the one it is displaying (format.zig).
+            .down_total => format.compareVolume(
+                format.rowVolume(a, .down),
+                format.rowVolume(b, .down),
+            ),
+            .up_total => format.compareVolume(
+                format.rowVolume(a, .up),
+                format.rowVolume(b, .up),
+            ),
         };
     }
 };
@@ -279,15 +289,47 @@ test "clicking a column re-sorts at once, not at the next beat" {
     defer testing.allocator.free(by_up_total);
     try expectOrder(&.{ "b.exe", "a.exe" }, by_up_total);
 
-    o.sortBy(.pid, .ascending);
-    const by_pid = try names(testing.allocator, &o, &rows, 2);
-    defer testing.allocator.free(by_pid);
-    try expectOrder(&.{ "b.exe", "a.exe" }, by_pid);
-
     o.sortBy(.name, .ascending);
     const by_name = try names(testing.allocator, &o, &rows, 3);
     defer testing.allocator.free(by_name);
     try expectOrder(&.{ "a.exe", "b.exe" }, by_name);
+}
+
+test "a totals column ranks messages among the rows that moved no bytes" {
+    var o: Ordering = .{};
+    defer o.deinit(testing.allocator);
+    // An ICMP Flow moves messages and no bytes anyone can count (CONTEXT.md
+    // "ICMP Message Count"), so its row's totals cells show "N msgs".
+    const three = [_]snapshot.Flow{icmpFlow(3)};
+    const nine = [_]snapshot.Flow{icmpFlow(9)};
+    const rows = [_]snapshot.Row{
+        .{ .pid = 1, .create_time = 1, .name = "C:\\quiet.exe" },
+        .{ .pid = 2, .create_time = 2, .name = "C:\\ping3.exe", .flows = &three },
+        .{ .pid = 3, .create_time = 3, .name = "C:\\downloader.exe", .recv = 9000 },
+        .{ .pid = 4, .create_time = 4, .name = "C:\\ping9.exe", .flows = &nine },
+    };
+
+    o.sortBy(.down_total, .descending);
+    const shown = try names(testing.allocator, &o, &rows, 0);
+    defer testing.allocator.free(shown);
+    // Bytes outrank messages — they are not convertible, so the column ranks
+    // them by kind — and the busier pinger still leads the quieter one.
+    try expectOrder(&.{ "downloader.exe", "ping9.exe", "ping3.exe", "quiet.exe" }, shown);
+}
+
+/// An ICMP Flow that has received `msgs` messages and, like every ICMP Flow,
+/// no bytes.
+fn icmpFlow(msgs: u64) snapshot.Flow {
+    return .{
+        .proto = .icmp,
+        .family = .v4,
+        .local_addr = @splat(0),
+        .remote_addr = @splat(0),
+        .local_port = 0,
+        .remote_port = 0,
+        .generation = 1,
+        .msgs_recv = msgs,
+    };
 }
 
 test "a process that starts between beats lands at the bottom, and is never lost" {
