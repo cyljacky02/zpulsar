@@ -13,10 +13,8 @@ const std = @import("std");
 const win32 = @import("win32");
 const event = @import("event.zig");
 
-/// What kind of Group Address a datagram was sent to, if any. Declared in
-/// event.zig because it is part of `event.ConnKey` — a group-addressed
-/// conversation and a unicast one with the same peer on the same ports are
-/// distinct Flows — and re-exported here, where its value is decided.
+/// Re-exported from event.zig, which declares it because `event.ConnKey`
+/// carries it; this module is where its value is decided.
 pub const GroupKind = event.GroupKind;
 
 /// One local unicast address and the on-link prefix it sits in — the fact no
@@ -76,7 +74,7 @@ pub const LocalPrefixes = struct {
 /// bytes, untouched.
 pub fn classify(prefixes: LocalPrefixes, family: event.Family, addr: [16]u8) Classified {
     const norm = (event.IpAddr{ .family = family, .addr = addr }).normalized();
-    return switch (norm.family) {
+    const out: Classified = switch (norm.family) {
         .v4 => classifyV4(prefixes, norm.addr, addr),
         .v6 => if (norm.addr[0] == 0xff)
             // ff00::/8. IPv6 has no broadcast: an "all nodes on this link"
@@ -85,6 +83,25 @@ pub fn classify(prefixes: LocalPrefixes, family: event.Family, addr: [16]u8) Cla
         else
             .plain(addr),
     };
+    // Normalizing to classify must not leak into the answer. A dual-stack
+    // socket's receive is a v6 event, so a resolved interface address handed
+    // back in v4 layout would sit in the Flow under a v6 family and render as
+    // a wholly different address. The unspecified address is family-agnostic
+    // and stays as it is; `.none` already carries the caller's own bytes.
+    if (family == .v6 and norm.family == .v4 and
+        !std.mem.allEqual(u8, &out.local_addr, 0))
+        return .group(out.kind, mappedV6(out.local_addr));
+    return out;
+}
+
+/// The IPv4-mapped IPv6 form of a v4 address (`::ffff:a.b.c.d`, RFC 4291
+/// §2.5.5.2) — the inverse of `event.IpAddr.normalized`.
+fn mappedV6(addr: [16]u8) [16]u8 {
+    var out: [16]u8 = @splat(0);
+    out[10] = 0xff;
+    out[11] = 0xff;
+    @memcpy(out[12..16], addr[0..4]);
+    return out;
 }
 
 fn classifyV4(prefixes: LocalPrefixes, norm: [16]u8, original: [16]u8) Classified {
@@ -141,10 +158,12 @@ pub const FetchError = error{ OutOfMemory, TableQueryFailed };
 pub fn fetch(gpa: std.mem.Allocator) FetchError!LocalPrefixes {
     var table: ?*win32.MIB_UNICASTIPADDRESS_TABLE = null;
     const rc = win32.GetUnicastIpAddressTable(win32.AF_UNSPEC, &table);
-    const t = table orelse return error.TableQueryFailed;
-    // The table allocates on success; free it whatever we make of the rows.
-    defer win32.FreeMibTable(t);
+    // Status first: only a successful call allocates, so only a successful
+    // call may be freed (win32.zig). Then the free is paired for the whole
+    // remainder, whatever we make of the rows.
     if (rc != win32.STATUS_SUCCESS) return error.TableQueryFailed;
+    const t = table orelse return error.TableQueryFailed;
+    defer win32.FreeMibTable(t);
 
     const rows = @as([*]const win32.MIB_UNICASTIPADDRESS_ROW, @ptrCast(&t.Table))[0..t.NumEntries];
     var list: std.ArrayList(Prefix) = .empty;
@@ -244,9 +263,9 @@ test "a directed broadcast resolves to the interface that received it" {
     try std.testing.expectEqual(GroupKind.none, classify(two_nics, .v4, v4(192, 168, 88, 7)).kind);
     // /24 means 172.17.79.255 would NOT be this interface's broadcast; the /20
     // is what makes it one. Same address, different prefix, different answer.
-    const narrow: LocalPrefixes = .{ .entries = &.{
+    const narrow: LocalPrefixes = .borrow(&.{
         .{ .family = .v4, .addr = v4(172, 17, 64, 1), .prefix_len = 24 },
-    } };
+    });
     try std.testing.expectEqual(GroupKind.none, classify(narrow, .v4, v4(172, 17, 79, 255)).kind);
 }
 
@@ -259,10 +278,10 @@ test "resolution is refused rather than guessed" {
 
     // Two interfaces on one subnet: still a broadcast, but naming either would
     // be inventing the answer, so the local side stays unspecified.
-    const dual: LocalPrefixes = .{ .entries = &.{
+    const dual: LocalPrefixes = .borrow(&.{
         .{ .family = .v4, .addr = v4(192, 168, 88, 254), .prefix_len = 24 },
         .{ .family = .v4, .addr = v4(192, 168, 88, 99), .prefix_len = 24 },
-    } };
+    });
     const ambiguous = classify(dual, .v4, v4(192, 168, 88, 255));
     try std.testing.expectEqual(GroupKind.broadcast, ambiguous.kind);
     try std.testing.expectEqualSlices(u8, &unspecified, &ambiguous.local_addr);
@@ -277,16 +296,16 @@ test "prefix lengths without a broadcast address are skipped" {
     // /31 is point-to-point (RFC 3021), /32 is a host route, /0 names no
     // subnet: none of them has an all-ones host address to match against.
     for ([_]u8{ 0, 31, 32 }) |len| {
-        const p: LocalPrefixes = .{ .entries = &.{
+        const p: LocalPrefixes = .borrow(&.{
             .{ .family = .v4, .addr = v4(192, 168, 88, 254), .prefix_len = len },
-        } };
+        });
         try std.testing.expectEqual(GroupKind.none, classify(p, .v4, v4(192, 168, 88, 255)).kind);
         try std.testing.expectEqual(GroupKind.none, classify(p, .v4, v4(255, 255, 255, 254)).kind);
     }
     // A /30's broadcast is the top of its four-address block.
-    const p30: LocalPrefixes = .{ .entries = &.{
+    const p30: LocalPrefixes = .borrow(&.{
         .{ .family = .v4, .addr = v4(10, 0, 0, 5), .prefix_len = 30 },
-    } };
+    });
     const got = classify(p30, .v4, v4(10, 0, 0, 7));
     try std.testing.expectEqual(GroupKind.broadcast, got.kind);
     try std.testing.expectEqualSlices(u8, &v4(10, 0, 0, 5), &got.local_addr);
@@ -298,17 +317,36 @@ test "an IPv4-mapped multicast address cannot slip past the predicate" {
     const mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ [4]u8{ 224, 0, 0, 251 };
     const got = classify(.empty, .v6, mapped);
     try std.testing.expectEqual(GroupKind.multicast, got.kind);
+    // Unspecified is the same address in either family, so it needs no mapping.
     try std.testing.expectEqualSlices(u8, &unspecified, &got.local_addr);
+}
+
+test "a resolved address comes back in the family it was asked about" {
+    // Normalizing to classify must not leak into the answer: the Flow's family
+    // comes from the event id, so handing a v6 receive a v4-layout address
+    // would key and render it as an entirely different address —
+    // 192.168.88.254 would print as c0a8:58fe::.
+    const mapped_bcast =
+        [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ [4]u8{ 192, 168, 88, 255 };
+    const got = classify(two_nics, .v6, mapped_bcast);
+    try std.testing.expectEqual(GroupKind.broadcast, got.kind);
+    const expected =
+        [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff } ++ [4]u8{ 192, 168, 88, 254 };
+    try std.testing.expectEqualSlices(u8, &expected, &got.local_addr);
+    // The plain v4 receive of the same datagram is untouched by the mapping.
+    const v4_got = classify(two_nics, .v4, v4(192, 168, 88, 255));
+    try std.testing.expectEqualSlices(u8, &v4(192, 168, 88, 254), &v4_got.local_addr);
 }
 
 test "v6 prefixes never produce a broadcast match" {
     // IPv6 has no broadcast address at all, so a v6 row in the table must not
     // participate in the directed-broadcast scan.
-    const mixed: LocalPrefixes = .{ .entries = &.{
+    const mixed: LocalPrefixes = .borrow(&.{
         .{ .family = .v6, .addr = @splat(0xff), .prefix_len = 24 },
         .{ .family = .v4, .addr = v4(192, 168, 88, 254), .prefix_len = 24 },
-    } };
+    });
     const got = classify(mixed, .v4, v4(192, 168, 88, 255));
     try std.testing.expectEqual(GroupKind.broadcast, got.kind);
     try std.testing.expectEqualSlices(u8, &v4(192, 168, 88, 254), &got.local_addr);
 }
+

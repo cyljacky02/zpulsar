@@ -181,7 +181,9 @@ pub const MIB_UNICASTIPADDRESS_ROW = ip_helper.MIB_UNICASTIPADDRESS_ROW;
 pub const MIB_UNICASTIPADDRESS_TABLE = ip_helper.MIB_UNICASTIPADDRESS_TABLE;
 
 /// The row's address is a `SOCKADDR_INET` union: read `si_family` to pick the
-/// arm, then the v4 or v6 bytes, which are already network order.
+/// arm, then the v4 or v6 bytes, which are already network order. `si_family`
+/// is the typed `ADDRESS_FAMILY`, so the arm test compares against
+/// `AF_INET_FAMILY`/`AF_INET6_FAMILY` below, not a bare integer.
 pub const SOCKADDR_INET = win_sock.SOCKADDR_INET;
 
 /// `GetUnicastIpAddressTable` returns NTSTATUS, not the `u32` WIN32_ERROR the
@@ -194,9 +196,6 @@ pub const STATUS_SUCCESS: NTSTATUS = .SUCCESS;
 /// the reverse-lookup helpers below), unlike the extended-table calls above
 /// which take a bare `u32`. AF_UNSPEC fetches both families in one call.
 pub const AF_UNSPEC = win_sock.AF_UNSPEC;
-
-/// `SOCKADDR_INET.si_family` is the typed `ADDRESS_FAMILY`; the arm test uses
-/// `AF_INET_FAMILY`/`AF_INET6_FAMILY` below.
 
 // ---------------------------------------------------------------------------
 // Service Control Manager (advapi32) — the PID → hosted-services map

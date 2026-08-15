@@ -1669,6 +1669,46 @@ test "a group Flow covers its bound socket, so the sweep seeds no duplicate" {
     try std.testing.expectEqual(event.GroupKind.multicast, f.group_kind);
 }
 
+test "a specifically-bound socket shows the extra row ADR-0004 accepts" {
+    // The other side of the under-claim above. presenceTuple cannot know which
+    // address the socket bound, so a socket bound to a concrete address has
+    // its table row seeded beside the group Flow. That extra row is a real
+    // bound socket — the deliberate cost of never claiming coverage of an
+    // endpoint the Flow may not own.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const bound: event.ConnKey = .{
+        .proto = .udp,
+        .family = .v4,
+        .local_addr = ip4(192, 168, 88, 254),
+        .remote_addr = @splat(0),
+        .local_port = 5353,
+        .remote_port = 0,
+    };
+    try core.reconcile(&.{.{ .pid = 901, .key = bound }}, 0);
+    try core.applyEvent(
+        udpEvent(.recv, 901, ip4(224, 0, 0, 251), ip4(192, 168, 88, 7), 5353),
+        0,
+    );
+    try core.reconcile(&.{.{ .pid = 901, .key = bound }}, 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 901).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    var groups: usize = 0;
+    var placeholders: usize = 0;
+    for (row.flows) |f| {
+        if (f.group_kind == .multicast) groups += 1;
+        // The seeded row is the socket itself: bound address, no peer.
+        if (f.group_kind == .none and f.remote_port == 0) placeholders += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), groups);
+    try std.testing.expectEqual(@as(usize, 1), placeholders);
+}
+
 test "UDP Flows age out after 60 s inactivity into normal Linger" {
     var core = Core.init(std.testing.allocator);
     defer core.deinit();

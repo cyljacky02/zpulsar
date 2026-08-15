@@ -1,10 +1,19 @@
-# A Group Address never occupies a Flow's local endpoint
+# A recognized Group Address is vacated from a Flow's local endpoint
 
 When a UDP datagram is addressed to a **Group Address** — a multicast group, the limited
 broadcast address, or a subnet-directed broadcast — that address is vacated from the receiving
 Flow's local endpoint and carried as an attribute instead. The local port is unchanged. The
 local *address* becomes the receiving interface's unicast address where that is derivable, and
 the unspecified address otherwise.
+
+**"Recognized" is load-bearing and the rule is not absolute.** Multicast and the limited
+broadcast address are self-describing, so they are always caught. A subnet-directed broadcast is
+not: it is only recognisable against a prefix this machine holds. Another subnet's directed
+broadcast — and any directed broadcast at all before the first prefix fetch succeeds, or after
+one fails with no earlier table to fall back on — is indistinguishable from an ordinary host
+address, stays in the local endpoint, and reads exactly as it did before this decision. That is
+the pre-existing behaviour #41 filed against, surviving in the corner where the information to
+do better genuinely is not there.
 
 This resolves the tension [#41](https://github.com/cyljacky02/zpulsar/issues/41) opened against
 [#36](https://github.com/cyljacky02/zpulsar/issues/36). #36 established by controlled live trace
@@ -107,6 +116,11 @@ free, exactly as it inherits orientation today, so the two parse paths cannot di
 - **Two Groups of the same kind, same ports, same peer, merge**, and the displayed address is
   whichever arrived last. `group_kind` separates group traffic from unicast, not one group from
   another.
+- **The sweep now makes two blocking IP Helper calls back to back** on the Engine thread — the
+  prefix table alongside the owner tables. ADR-0002 assigns table snapshots to the metadata lane;
+  `snapshotConnections` already runs inline here, and this follows it rather than opening a
+  second precedent. The cadence is 10 s and neither call is on the event path, but if the pair
+  ever costs enough to show in the idle-CPU budget, both belong on the lane together.
 - **Up to 10 s of staleness.** A newly added subnet's directed broadcasts classify as unicast
   until the next sweep, reading exactly as they did before this decision. A failed table query
   keeps the last good table and retries, mirroring how a failed owner-table query is already
