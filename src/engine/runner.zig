@@ -57,7 +57,8 @@ pub const Engine = struct {
     reverse: ?*reverse_lookup.Lane,
     core: core_mod.Core,
     /// Metadata resolver lane (ADR-0002 thread 4): the service map and
-    /// per-socket owner-module lookups Service Attribution needs.
+    /// per-socket owner-module lookups Service Attribution needs, plus the
+    /// one-shot startup resolver-cache probe (issue #34).
     lane: *resolver.Lane,
     published: snapshot.Published,
     ring_wake: sync.WakeEvent,
@@ -128,6 +129,9 @@ pub const Engine = struct {
         };
         errdefer self.core.deinit();
         self.core.reverse = self.reverse;
+        // Lets Core drop the 3008 echo the resolver-cache probe provokes in
+        // this process (core.applyDns). Set before any event can be drained.
+        self.core.self_pid = win32.currentProcessId();
 
         // Display-only: a failed drive map just leaves names as raw NT paths.
         self.core.drive_map = device_map.query(gpa) catch .{};
@@ -150,6 +154,11 @@ pub const Engine = struct {
         // Service Attribution's map is wanted before the first Flow needs it,
         // so ask for it up front rather than on the first miss.
         self.core.requestServiceMap(0);
+        // The resolver cache is the only record of names resolved before now,
+        // and the Flows just seeded above are the ones it can name (issue
+        // #34). Posted, not called: it goes to the resolver lane like every
+        // other blocking lookup, so startup never waits on the resolver.
+        self.core.requestDnsCache();
 
         self.resolver_thread = std.Thread.spawn(.{}, resolver.Lane.run, .{lane}) catch
             return error.SpawnFailed;

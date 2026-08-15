@@ -9,6 +9,7 @@
 const std = @import("std");
 const zigwin32 = @import("zigwin32");
 
+const dns = zigwin32.network_management.dns;
 const etw = zigwin32.system.diagnostics.etw;
 const ip_helper = zigwin32.network_management.ip_helper;
 const win_sock = zigwin32.networking.win_sock;
@@ -271,6 +272,93 @@ pub fn wsaStartup() bool {
 }
 
 // ---------------------------------------------------------------------------
+// DNS resolver cache (dnsapi) — the one-shot startup snapshot (issue #34).
+//
+// `DnsGetCacheDataTable` is **undocumented**, and taking it over the
+// documented `MSFT_DNSClientCache` CIM class reverses what
+// docs/research/dns-client-etw.md §3 recommended. The reason is measured, not
+// aesthetic: reading the CIM class makes the DNS client re-query every cached
+// name, and each of those cache hits emits a real 3008 *inside the WMI
+// provider host*, which the Engine would then have to tell apart from a
+// genuine observation by a process it cannot identify. The dnsapi route puts
+// the same unavoidable echo inside **our own process**, where one PID
+// comparison suppresses it exactly (core.zig `applyDns`). See §3 for the
+// experiment.
+//
+// The cache table carries names and record types only — no data — so the
+// addresses come from a per-name `DnsQuery_W`, which is documented. That is
+// the whole undocumented surface: one export and one 24-byte struct, both
+// asserted below.
+// ---------------------------------------------------------------------------
+
+/// dnsapi's cache table entry. No SDK header declares it; the layout is the
+/// long-published one (x64: two pointers, two words, one dword) and is
+/// verified live by the headless rig's `--dns-cache` mode.
+pub const DNS_CACHE_ENTRY = extern struct {
+    next: ?*DNS_CACHE_ENTRY,
+    /// Owned by dnsapi — freed with `DnsFree(.., .Flat)`, like the entry.
+    name: ?[*:0]u16,
+    record_type: u16,
+    data_length: u16,
+    flags: u32,
+};
+
+/// Undocumented: fills `head` with a linked list of every cached (name, type)
+/// pair. Nonzero on success. Declared here rather than taken from the binding
+/// because the generator only covers documented exports.
+pub extern "dnsapi" fn DnsGetCacheDataTable(
+    head: *?*DNS_CACHE_ENTRY,
+) callconv(.winapi) i32;
+
+pub const DnsQuery_W = zigwin32.dnsapi.DnsQuery_W;
+pub const DnsFree = zigwin32.dnsapi.DnsFree;
+
+pub const DNS_RECORDW = dns.DNS_RECORDW;
+pub const DNS_FREE_TYPE = dns.DNS_FREE_TYPE;
+pub const DnsFreeFlat = dns.DnsFreeFlat;
+pub const DnsFreeRecordList = dns.DnsFreeRecordList;
+pub const DNS_TYPE = dns.DNS_TYPE;
+pub const DNS_QUERY_OPTIONS = dns.DNS_QUERY_OPTIONS;
+/// `DnsQuery_W` takes no options: the standard query is the only one that
+/// reads the *machine's* resolver cache. `DNS_QUERY_NO_WIRE_QUERY` sounds
+/// like what the probe wants and is not — measured, it consults only the
+/// calling process's own cache and the hosts file, so in a freshly started
+/// zPulsar it answers `DNS_INFO_NO_RECORDS` for every real name.
+pub const DNS_QUERY_STANDARD: DNS_QUERY_OPTIONS = .{};
+
+/// `DnsQuery_W` answers with a `WIN32_ERROR`, where anything but `NO_ERROR` —
+/// `DNS_INFO_NO_RECORDS` (9701) for a negative cache entry, most often —
+/// means no records came back.
+pub const DNS_SECTION = dns.DNS_SECTION;
+pub const DnsSectionAnswer = dns.DnsSectionAnswer;
+
+/// Which section of the response a record came from. `DnsQuery_W` was measured
+/// to return answer-section records only, so the probe's check on this is
+/// insurance rather than a filter that fires: what it excludes is the
+/// authority and additional sections, whose address records name *other* hosts
+/// (nameserver glue).
+///
+/// windns.h declares `DNS_RECORD_FLAGS` as a bitfield (`Section : 2` first);
+/// the binding leaves it an opaque `_bitfield: u32`, so the two bits are
+/// masked out of the union's `DW` view here rather than guessed at elsewhere.
+pub fn dnsRecordSection(record: *const DNS_RECORDW) DNS_SECTION {
+    return @enumFromInt(record.Flags.DW & 0b11);
+}
+
+/// The v4 address inside a `DNS_RECORDW`'s data union, as raw network-order
+/// bytes. `DNS_A_DATA.IpAddress` is an `IP4_ADDRESS` (a u32 already in
+/// network order), so this is a reinterpretation, never a byte swap.
+pub fn dnsRecordIp4(record: *const DNS_RECORDW) [4]u8 {
+    return @bitCast(record.Data.A.IpAddress);
+}
+
+/// The v6 address inside a `DNS_RECORDW`'s data union, network order.
+pub fn dnsRecordIp6(record: *const DNS_RECORDW) [16]u8 {
+    return @bitCast(record.Data.AAAA.Ip6Address);
+}
+
+
+// ---------------------------------------------------------------------------
 // DOS device mapping (kernel32) — NT device path → drive letter display
 // ---------------------------------------------------------------------------
 
@@ -297,6 +385,12 @@ pub fn systemTimeAsFileTime() u64 {
     var ft: foundation.FILETIME = undefined;
     zigwin32.kernel32.GetSystemTimeAsFileTime(&ft);
     return (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+/// This process's id — what `core.applyDns` compares a 3008's header PID
+/// against to drop the resolver-cache probe's own echo.
+pub fn currentProcessId() u32 {
+    return zigwin32.kernel32.GetCurrentProcessId();
 }
 
 pub const GetStdHandle = zigwin32.kernel32.GetStdHandle;
@@ -552,6 +646,55 @@ comptime {
     // ws2tcpip.h getnameinfo flags
     assert(NI_NAMEREQD == 0x04);
     assert(NI_NUMERICSERV == 0x08);
+
+    // dnsapi DNS_CACHE_ENTRY — the one struct here with no SDK header to
+    // check against, so its layout is pinned explicitly: two pointers, two
+    // words, one dword, 8-aligned. Getting it wrong walks a linked list
+    // through the wrong offsets.
+    assert(@sizeOf(DNS_CACHE_ENTRY) == 24);
+    assert(@alignOf(DNS_CACHE_ENTRY) == 8);
+    assert(@offsetOf(DNS_CACHE_ENTRY, "next") == 0);
+    assert(@offsetOf(DNS_CACHE_ENTRY, "name") == 8);
+    assert(@offsetOf(DNS_CACHE_ENTRY, "record_type") == 16);
+    assert(@offsetOf(DNS_CACHE_ENTRY, "data_length") == 18);
+    assert(@offsetOf(DNS_CACHE_ENTRY, "flags") == 20);
+
+    // windns.h DNS_RECORDW — the list DnsQuery_W allocates and hands back.
+    // The probe reads the header fields and two members of the data union.
+    // No exact `@sizeOf`: the union's widest member is whichever record type
+    // the SDK grew last, so pinning a number here would assert something the
+    // probe does not depend on. What it does depend on is that the record is
+    // at least big enough for the AAAA payload it reads out of `Data`.
+    assert(@alignOf(DNS_RECORDW) == 8);
+    assert(@sizeOf(DNS_RECORDW) >= @offsetOf(DNS_RECORDW, "Data") + 16);
+    assert(@offsetOf(DNS_RECORDW, "pNext") == 0);
+    assert(@offsetOf(DNS_RECORDW, "pName") == 8);
+    assert(@offsetOf(DNS_RECORDW, "wType") == 16);
+    assert(@offsetOf(DNS_RECORDW, "wDataLength") == 18);
+    assert(@offsetOf(DNS_RECORDW, "Flags") == 20);
+    assert(@offsetOf(DNS_RECORDW, "dwTtl") == 24);
+    assert(@offsetOf(DNS_RECORDW, "Data") == 32);
+    // The two address payloads, reinterpreted as raw bytes by the helpers
+    // above — so their widths are what make that reinterpretation honest.
+    assert(@sizeOf(@FieldType(dns.DNS_A_DATA, "IpAddress")) == 4);
+    assert(@sizeOf(@FieldType(dns.DNS_AAAA_DATA, "Ip6Address")) == 16);
+
+    // windns.h DNS_RECORD_FLAGS: `Section : 2` is the first bitfield member,
+    // so it occupies the low two bits of the union's DW view — which is what
+    // `dnsRecordSection` masks.
+    assert(@sizeOf(dns.DNS_RECORD_FLAGS) == 4);
+    assert(@intFromEnum(dns.DnsSectionQuestion) == 0);
+    assert(@intFromEnum(DnsSectionAnswer) == 1);
+    assert(@intFromEnum(dns.DnsSectionAuthority) == 2);
+    assert(@intFromEnum(dns.DnsSectionAddtional) == 3);
+
+    // windns.h free kinds.
+    assert(@intFromEnum(DnsFreeFlat) == 0);
+    assert(@intFromEnum(DnsFreeRecordList) == 1);
+    // A standard query is all-bits-zero; NO_WIRE_QUERY is deliberately unset
+    // (it reads only the calling process's cache — see the note above).
+    assert(@as(u32, @bitCast(DNS_QUERY_STANDARD)) == 0);
+    assert(@as(u32, @bitCast(dns.DNS_QUERY_NO_WIRE_QUERY)) == 0x10);
 }
 
 test {

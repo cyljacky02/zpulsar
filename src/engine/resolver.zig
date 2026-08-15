@@ -1,8 +1,15 @@
-//! The metadata resolver lane (ADR-0002 thread 4): the blocking lookups
-//! Service Attribution needs — the SCM enumeration and per-socket owner-module
-//! calls — run here, never on the Engine thread. `netstat -b`, the in-box
-//! consumer of the same machinery, is documented as "time-consuming"; that
-//! cost is exactly why it is off the hot path.
+//! The metadata resolver lane (ADR-0002 thread 4): the Engine's blocking
+//! lookups run here, never on the Engine thread. Service Attribution's SCM
+//! enumeration and per-socket owner-module calls (`netstat -b`, the in-box
+//! consumer of the same machinery, is documented as "time-consuming"), and the
+//! one-shot startup resolver-cache probe (issue #34), which costs a resolver
+//! round trip per cached name. That cost is exactly why they are off the hot
+//! path.
+//!
+//! The probe is one-shot and lands at startup, so it does hold the lane while
+//! it runs, and the first owner-module queries queue behind it. That is the
+//! lane's documented bargain — a slow lookup costs Flows their label and
+//! nothing else — and the probe bounds itself (dns_cache.max_records).
 //!
 //! The Engine's side of the lane is non-blocking in both directions: requests
 //! go into a bounded ring (drop-newest, counted), completions come out of
@@ -11,6 +18,7 @@
 //! publishing never wait on it.
 
 const std = @import("std");
+const dns_cache = @import("dns_cache.zig");
 const flows = @import("flows.zig");
 const owner_module = @import("owner_module.zig");
 const service_map = @import("service_map.zig");
@@ -29,9 +37,14 @@ pub const OwnerQuery = struct {
     create_time: u64,
 };
 
-/// Work for the lane. `service_map` refreshes the PID → hosted-services map.
+/// Work for the lane. `service_map` refreshes the PID → hosted-services map;
+/// `dns_cache` is the one-shot startup resolver-cache snapshot (issue #34),
+/// which lands here for the same reason everything else does — it is a
+/// blocking call — a resolver round trip per cached name — that must not sit
+/// on the Engine thread.
 pub const Request = union(enum) {
     service_map,
+    dns_cache,
     owner_module: OwnerQuery,
 };
 
@@ -41,6 +54,9 @@ pub const Completion = union(enum) {
     /// A fresh SCM enumeration, or null when the query failed — the Engine
     /// keeps whatever map it already had.
     service_map: ?*service_map.Raw,
+    /// The resolver cache as it stood at startup, or null when the probe
+    /// could not run — pre-start names then stay with the reverse-lookup lane.
+    dns_cache: ?*dns_cache.Snapshot,
     owner_module: OwnerResult,
 
     /// Release any payload the Engine never took ownership of (a completion
@@ -48,6 +64,7 @@ pub const Completion = union(enum) {
     pub fn deinit(self: Completion, gpa: std.mem.Allocator) void {
         switch (self) {
             .service_map => |raw| if (raw) |r| r.deinit(gpa),
+            .dns_cache => |snap| if (snap) |s| s.deinit(gpa),
             .owner_module => |r| if (r.module) |m| gpa.free(m),
         }
     }
@@ -70,6 +87,9 @@ pub const OwnerResult = struct {
 pub const Lookups = struct {
     ctx: ?*anyopaque = null,
     queryServiceMap: *const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?*service_map.Raw,
+    /// The startup resolver-cache snapshot. Null on any failure — the Engine
+    /// treats a probe that could not run and one that found nothing alike.
+    queryDnsCache: *const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator) ?*dns_cache.Snapshot,
     /// Resolves a whole batch: `out[i]` is the owned module name for
     /// `queries[i]`, or null. Batching lets one table snapshot serve every
     /// query in it.
@@ -84,11 +104,16 @@ pub const Lookups = struct {
 /// The real Windows lookups.
 pub const system_lookups: Lookups = .{
     .queryServiceMap = systemQueryServiceMap,
+    .queryDnsCache = systemQueryDnsCache,
     .resolveOwners = systemResolveOwners,
 };
 
 fn systemQueryServiceMap(_: ?*anyopaque, gpa: std.mem.Allocator) ?*service_map.Raw {
     return service_map.query(gpa);
+}
+
+fn systemQueryDnsCache(_: ?*anyopaque, gpa: std.mem.Allocator) ?*dns_cache.Snapshot {
+    return dns_cache.query(gpa);
 }
 
 fn systemResolveOwners(
@@ -275,6 +300,9 @@ pub const Lane = struct {
             .service_map => self.complete(.{
                 .service_map = self.lookups.queryServiceMap(self.lookups.ctx, self.gpa),
             }),
+            .dns_cache => self.complete(.{
+                .dns_cache = self.lookups.queryDnsCache(self.lookups.ctx, self.gpa),
+            }),
             .owner_module => |q| {
                 queries[n] = q;
                 n += 1;
@@ -333,6 +361,7 @@ const FakeLookups = struct {
         return .{
             .ctx = self,
             .queryServiceMap = queryServiceMap,
+            .queryDnsCache = queryDnsCache,
             .resolveOwners = resolveOwners,
         };
     }
@@ -355,6 +384,15 @@ const FakeLookups = struct {
         self.hold();
         _ = self.maps.fetchAdd(1, .monotonic);
         return service_map.fromPairs(gpa, 200, &.{.{ .pid = 900, .name = "RpcSs" }}) catch null;
+    }
+
+    fn queryDnsCache(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?*dns_cache.Snapshot {
+        const self: *FakeLookups = @ptrCast(@alignCast(ctx.?));
+        self.hold();
+        return dns_cache.fromRecords(gpa, &.{.{
+            .ip = .{ .family = .v4, .addr = [4]u8{ 93, 184, 216, 34 } ++ @as([12]u8, @splat(0)) },
+            .name = "pre-start.example.test",
+        }}) catch null;
     }
 
     fn resolveOwners(
@@ -441,6 +479,28 @@ test "a stalled lookup never blocks the Engine's side of the lane" {
     try std.testing.expect(lane.waitExit(0));
 }
 
+test "the startup resolver-cache probe comes back as a completion" {
+    const gpa = std.testing.allocator;
+    var fake = try FakeLookups.init(gpa);
+    defer fake.deinit();
+
+    var lane: Lane = undefined;
+    try lane.init(gpa, fake.lookups());
+    defer lane.deinit();
+    const thread = try std.Thread.spawn(.{}, Lane.run, .{&lane});
+
+    try std.testing.expect(lane.submit(.dns_cache));
+    var answer: ?Completion = null;
+    while (answer == null) answer = lane.nextCompletion();
+    defer answer.?.deinit(gpa);
+
+    lane.shutdown();
+    thread.join();
+
+    const snap = answer.?.dns_cache orelse return error.ExpectedSnapshot;
+    try std.testing.expectEqualStrings("pre-start.example.test", snap.records[0].name);
+}
+
 test "duplicate service-map requests coalesce into one enumeration" {
     const gpa = std.testing.allocator;
     var fake = try FakeLookups.init(gpa);
@@ -473,11 +533,12 @@ test "answers the Engine never drained are freed with the lane" {
     try lane.init(gpa, fake.lookups());
     const thread = try std.Thread.spawn(.{}, Lane.run, .{&lane});
     try std.testing.expect(lane.submit(.service_map));
+    try std.testing.expect(lane.submit(.dns_cache));
     try std.testing.expect(lane.submit(.{ .owner_module = testOwnerQuery(51000) }));
     lane.shutdown();
     thread.join();
 
     // Nothing was ever drained; deinit owns what is left. The testing
-    // allocator fails this test if either payload leaks.
+    // allocator fails this test if any payload leaks.
     lane.deinit();
 }

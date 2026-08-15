@@ -1,7 +1,8 @@
 //! Debug-only headless target (ADR-0002): the full hot path with no UI —
 //! issue #20's tracer plus issue #21's Process Rows, issue #22's Flows,
-//! issue #23's rates, issue #26's Hostname Attribution, issue #25's Service
-//! Attribution, and issue #27's ICMP. Brings the `zPulsarNet` session up, runs
+//! issue #23's rates, issue #26's Hostname Attribution, issue #34's startup
+//! resolver-cache snapshot, issue #25's Service Attribution, and issue #27's
+//! ICMP. Brings the `zPulsarNet` session up, runs
 //! the consumer, Engine, resolver and reverse-lookup threads, and renders a
 //! live per-process table from acquired Snapshots — real image names, live
 //! down/up speeds, In-session Totals, dimmed "(exited)" rows, the service a
@@ -10,7 +11,7 @@
 //! names marked by the tier that produced them and each Flow's own service
 //! inside a shared host, health flags. Requires elevation.
 //!
-//! Usage: zpulsar-headless [--duration <seconds>]
+//! Usage: zpulsar-headless [--duration <seconds>] [--dns-cache]
 //! Default runs until Ctrl+C.
 
 const std = @import("std");
@@ -30,11 +31,16 @@ fn consoleCtrlHandler(ctrl_type: u32) callconv(.winapi) win32.BOOL {
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
+    const opts = try parseArgs(gpa, init.args);
+
+    // The probe stands alone: no ETW session, no elevation, and nothing else
+    // running to confuse what it printed.
+    if (opts.dns_cache_only) return dumpDnsCache(gpa);
 
     if (win32.SetConsoleCtrlHandler(consoleCtrlHandler, win32.TRUE) == win32.FALSE)
         std.debug.print("warning: SetConsoleCtrlHandler failed; console-ctrl will leak the session\n", .{});
 
-    const duration_s = try parseDurationArg(gpa, init.args);
+    const duration_s = opts.duration_s;
 
     const logical_cpus: u32 = @intCast(std.Thread.getCpuCount() catch 1);
     const session = engine.etw_session.start(logical_cpus) catch |err| {
@@ -332,11 +338,11 @@ fn groupLabel(f: engine.snapshot.Flow, buf: []u8) []const u8 {
         .multicast => "mcast",
         .broadcast => "bcast",
     };
-    var w: std.Io.Writer = .fixed(buf);
-    w.print("  [{s} ", .{kind}) catch return "";
-    writeAddr(&w, f.family, f.group_addr) catch return "";
-    w.writeByte(']') catch return "";
-    return w.buffered();
+    var abuf: [64]u8 = undefined;
+    return std.fmt.bufPrint(buf, "  [{s} {s}]", .{
+        kind,
+        fmtAddr(f.family, f.group_addr, null, &abuf),
+    }) catch "";
 }
 
 /// A Flow's own service. Only shared hosts need it: a single-service row
@@ -376,7 +382,6 @@ fn fmtActivity(f: engine.snapshot.Flow, dir: Direction, buf: []u8) []const u8 {
 /// "*" for an endpoint with nothing to show: a placeholder UDP socket's zero
 /// remote, an ICMP Flow's absent local side, or its peer before the first
 /// reply names it. ICMP has no ports, so its endpoints print bare addresses.
-/// v6 prints full-form groups — it's a debug rig.
 fn fmtEndpoint(f: engine.snapshot.Flow, side: Side, buf: []u8) []const u8 {
     const addr = switch (side) {
         .local => f.local_addr,
@@ -387,30 +392,29 @@ fn fmtEndpoint(f: engine.snapshot.Flow, side: Side, buf: []u8) []const u8 {
         .remote => f.remote_port,
     };
     if (port == 0 and std.mem.allEqual(u8, &addr, 0)) return "*";
-    const ported = f.proto != .icmp;
-    const bracket = ported and f.family == .v6;
-    var w: std.Io.Writer = .fixed(buf);
-    if (bracket) w.writeByte('[') catch return "?";
-    writeAddr(&w, f.family, addr) catch return "?";
-    if (bracket) w.writeByte(']') catch return "?";
-    if (ported) w.print(":{d}", .{port}) catch return "?";
-    return w.buffered();
+    return fmtAddr(f.family, addr, if (f.proto == .icmp) null else port, buf);
 }
 
-/// A bare address: the inner half of every endpoint above, and the whole of a
-/// Group Address badge, which has no port of its own — the port is the
-/// socket's and is already on the local endpoint.
-fn writeAddr(w: *std.Io.Writer, family: engine.event.Family, addr: [16]u8) !void {
+/// One address, with its port when the protocol has one (bracketed for v6).
+/// A null port gives the bare address — what a Group Address badge shows,
+/// since the group's port is the socket's and is already on the local
+/// endpoint. v6 prints full-form groups — it's a debug rig.
+fn fmtAddr(family: engine.event.Family, addr: [16]u8, port: ?u16, buf: []u8) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
     switch (family) {
-        .v4 => try w.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }),
+        .v4 => w.print("{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch return "?",
         .v6 => {
+            if (port != null) w.writeByte('[') catch return "?";
             var i: usize = 0;
             while (i < 16) : (i += 2) {
-                if (i > 0) try w.writeByte(':');
-                try w.print("{x}", .{std.mem.readInt(u16, addr[i..][0..2], .big)});
+                if (i > 0) w.writeByte(':') catch return "?";
+                w.print("{x}", .{std.mem.readInt(u16, addr[i..][0..2], .big)}) catch return "?";
             }
+            if (port != null) w.writeByte(']') catch return "?";
         },
     }
+    if (port) |p| w.print(":{d}", .{p}) catch return "?";
+    return w.buffered();
 }
 
 /// Busiest first: current speed leads (that is what a live rig is for),
@@ -464,21 +468,60 @@ fn enableVtProcessing() bool {
     return win32.setConsoleMode(handle, mode | win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
-fn parseDurationArg(gpa: std.mem.Allocator, args: std.process.Args) !u64 {
+const Options = struct {
+    /// 0 runs until Ctrl+C.
+    duration_s: u64 = 0,
+    dns_cache_only: bool = false,
+};
+
+fn parseArgs(gpa: std.mem.Allocator, args: std.process.Args) !Options {
+    var opts: Options = .{};
     var it = try std.process.Args.Iterator.initAllocator(args, gpa);
     defer it.deinit();
     _ = it.skip(); // exe name
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--duration")) {
+        if (std.mem.eql(u8, arg, "--dns-cache")) {
+            opts.dns_cache_only = true;
+        } else if (std.mem.eql(u8, arg, "--duration")) {
             const value = it.next() orelse {
                 std.debug.print("error: --duration needs a seconds argument\n", .{});
                 std.process.exit(2);
             };
-            return std.fmt.parseInt(u64, value, 10) catch {
+            opts.duration_s = std.fmt.parseInt(u64, value, 10) catch {
                 std.debug.print("error: --duration: '{s}' is not a number of seconds\n", .{value});
                 std.process.exit(2);
             };
         }
     }
-    return 0;
+    return opts;
+}
+
+/// `--dns-cache`: run the startup resolver-cache probe once and print what it
+/// found. The dnsapi plumbing behind it (engine/dns_cache.zig) is the one path
+/// in the Engine no unit test can reach — it needs the machine's real resolver
+/// cache — so this is where it gets exercised, including the undocumented
+/// `DnsGetCacheDataTable` layout and the freeing of what it hands back.
+///
+/// Note this mode leaves its own footprint: reading the cache re-reports every
+/// entry through the DNS-Client provider as a 3008 in this process. In a full
+/// run `core.applyDns` drops those; here nothing is listening.
+fn dumpDnsCache(gpa: std.mem.Allocator) void {
+    const snap = engine.dns_cache.query(gpa) orelse {
+        // Exactly what the Engine does with this: nothing loud. Pre-start
+        // names stay covered by the reverse-lookup lane, dimmed.
+        std.debug.print(
+            "resolver-cache probe failed — pre-start names fall back to the reverse-lookup lane\n",
+            .{},
+        );
+        return;
+    };
+    defer snap.deinit(gpa);
+
+    std.debug.print("resolver cache: {d} address records\n", .{snap.records.len});
+    var buf: [64]u8 = undefined;
+    for (snap.records) |r| {
+        std.debug.print("  {s:>39}  {s}", .{ fmtAddr(r.ip.family, r.ip.addr, null, &buf), r.name });
+        if (r.alias.len > 0) std.debug.print(" (via {s})", .{r.alias});
+        std.debug.print("\n", .{});
+    }
 }

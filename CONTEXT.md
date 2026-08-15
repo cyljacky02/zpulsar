@@ -55,8 +55,12 @@ Attributing a flow to the individual Windows service inside a shared host proces
 _Avoid_: svchost splitting
 
 **Hostname Attribution**:
-Labeling a flow's remote endpoint with the name the process actually resolved, observed at lookup time — falling back to reverse lookup only when no lookup was seen.
-_Avoid_: Reverse DNS (that's the fallback, not the mechanism)
+Labeling a flow's remote endpoint with the name the process actually resolved, observed at lookup time — falling back to a Hint only when no lookup was seen.
+_Avoid_: Reverse DNS (that's a fallback, not the mechanism)
+
+**Hint**:
+A remote name nobody was observed resolving: read from the machine's resolver cache at startup, for names resolved before zPulsar existed, or from a reverse lookup after that. A Hint says an address *was* resolved under a name, never by whom — so it renders dimmed behind its source's marker, and never displaces an observation.
+_Avoid_: Guess (a Hint is evidence, just not attributable), fallback name
 
 **Tray-idle**:
 The state where the main window is closed and only the tray icon remains: monitoring continues in full, footprint drops to the minimum.

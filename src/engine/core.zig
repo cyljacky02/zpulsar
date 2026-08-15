@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const device_map = @import("device_map.zig");
+const dns_cache = @import("dns_cache.zig");
 const event = @import("event.zig");
 const flows = @import("flows.zig");
 const group_addr = @import("group_addr.zig");
@@ -161,6 +162,11 @@ pub const Core = struct {
     /// Flows showing their bare endpoints — which is what the Engine does
     /// anyway until a lookup lands.
     reverse: ?*reverse_lookup.Lane = null,
+    /// zPulsar's own process id, set by the runner; 0 in tests, which matches
+    /// no querier. What it buys is `applyDns` ignoring our own resolutions —
+    /// see there. Not a `win32` call from here: Core imports std and the
+    /// engine only (ADR-0002), so the runner supplies it.
+    self_pid: u32 = 0,
     /// NT-device → drive-letter display conversion. Populated by the runner
     /// at start; owned (and freed) by Core.
     drive_map: device_map.DriveMap = .{},
@@ -501,6 +507,19 @@ pub const Core = struct {
         self.map_refresh.sent(now_ms);
     }
 
+    /// Ask for the startup resolver-cache snapshot (issue #34). Called once,
+    /// at Engine start: the cache is the only record of names resolved before
+    /// zPulsar existed, and it goes stale the moment monitoring begins —
+    /// everything after that arrives as a 3008 observation instead.
+    ///
+    /// Deliberately unconditional and unbounded in effect: a probe that never
+    /// comes back, or comes back empty, costs those Flows a dimmed name and
+    /// nothing else. There is no retry, because a second snapshot would only
+    /// re-report what the 3008 lane has been watching all along.
+    pub fn requestDnsCache(self: *Core) void {
+        _ = self.postRequest(.dns_cache);
+    }
+
     /// Hand queued work to the resolver lane and clear the outbox. Work the
     /// lane cannot take is dropped: the affected Flows keep the honest
     /// fallback rather than the Engine growing a queue behind a busy lane.
@@ -541,6 +560,14 @@ pub const Core = struct {
                 self.flows.eachUnclassified(Classifier{ .core = self, .now_ms = now_ms });
                 self.dirty = true;
             },
+            .dns_cache => |maybe_snap| {
+                // A probe that could not run says nothing about any address,
+                // so there is nothing to record: the affected Flows stay bare
+                // and the reverse-lookup lane picks them up past the grace.
+                const snap = maybe_snap orelse return;
+                defer snap.deinit(self.gpa);
+                self.applyDnsCache(snap, now_ms);
+            },
             .owner_module => |result| {
                 defer if (result.module) |m| self.gpa.free(m);
                 if (self.flows.applyOwnerModule(
@@ -551,6 +578,32 @@ pub const Core = struct {
                 )) self.dirty = true;
             },
         }
+    }
+
+    /// Fold the startup resolver-cache snapshot into the hint tier (issue
+    /// #34). Every record is a *hint*: the cache is per-machine and carries no
+    /// PID, so it lands in tier 3 marked `.cache`, where it can never outrank
+    /// an observation and renders dimmed.
+    ///
+    /// Flows already open are named in the same pass — the cold-start table
+    /// seed seeds precisely the connections that predate zPulsar, which are
+    /// exactly the ones this snapshot exists to name.
+    fn applyDnsCache(self: *Core, snap: *const dns_cache.Snapshot, now_ms: u64) void {
+        for (snap.records) |rec| {
+            // Best-effort per record: one that cannot be stored costs a single
+            // dimmed name, and the reverse lane still covers its address.
+            self.names.noteHint(self.gpa, rec.ip, .{
+                .text = rec.name,
+                .alias = rec.alias,
+                .origin = .cache,
+            }, now_ms) catch continue;
+        }
+        // Then *one* walk of the Flow table, rather than one per record: the
+        // snapshot and the Flow table are each capped in the thousands, so
+        // naming per record would multiply them together on the Engine thread
+        // — see `flows.nameFromTiers`.
+        if (self.flows.nameFromTiers(self.gpa, &self.names, now_ms) catch false)
+            self.dirty = true;
     }
 
     /// The row's hosted service whose name the owner module matches, or null.
@@ -628,6 +681,16 @@ pub const Core = struct {
         ev: event.DnsEvent,
         now_ms: u64,
     ) error{OutOfMemory}!void {
+        // Our own resolutions are never observations of anything. The startup
+        // resolver-cache probe (dns_cache.zig) has to ask the resolver for
+        // each cached name to get its addresses, and the DNS-Client provider
+        // reports every one of those cache hits as a completed resolution in
+        // *this* process. Letting the echo through would launder the whole
+        // snapshot from a dimmed `.cache` hint into a plain `.observed` name —
+        // an authoritative-looking claim that some process resolved the
+        // address, on the strength of zPulsar reading a cache. zPulsar opens
+        // no connections of its own, so nothing legitimate is lost.
+        if (ev.pid == self.self_pid) return;
         // A nameless observation would occupy the global tier without naming
         // anything — and, worse, suppress the reverse lookup that would have.
         if (ev.name_len == 0) return;
@@ -2660,7 +2723,12 @@ const StalledLookups = struct {
     stalling: std.atomic.Value(bool) = .init(true),
 
     fn lookups(self: *StalledLookups) resolver.Lookups {
-        return .{ .ctx = self, .queryServiceMap = queryServiceMap, .resolveOwners = resolveOwners };
+        return .{
+            .ctx = self,
+            .queryServiceMap = queryServiceMap,
+            .queryDnsCache = queryDnsCache,
+            .resolveOwners = resolveOwners,
+        };
     }
 
     fn hold(self: *StalledLookups) void {
@@ -2669,6 +2737,12 @@ const StalledLookups = struct {
     }
 
     fn queryServiceMap(ctx: ?*anyopaque, _: std.mem.Allocator) ?*service_map.Raw {
+        const self: *StalledLookups = @ptrCast(@alignCast(ctx.?));
+        self.hold();
+        return null;
+    }
+
+    fn queryDnsCache(ctx: ?*anyopaque, _: std.mem.Allocator) ?*dns_cache.Snapshot {
         const self: *StalledLookups = @ptrCast(@alignCast(ctx.?));
         self.hold();
         return null;
@@ -2885,6 +2959,199 @@ test "the CNAME tail rides along to the Flow for optional display" {
     const flow = firstFlow(snap, 100);
     try std.testing.expectEqualStrings("www.microsoft.test", flow.remote_hostname.?);
     try std.testing.expectEqualStrings(alias, flow.remote_alias.?);
+}
+
+/// The startup resolver-cache snapshot as the lane delivers it (issue #34):
+/// addresses named, with no PID attached to any of them.
+fn cacheCompletion(records: []const dns_cache.Record) !resolver.Completion {
+    return .{ .dns_cache = try dns_cache.fromRecords(std.testing.allocator, records) };
+}
+
+test "a Flow to an address resolved before zPulsar started shows the cached name, marked cache-derived" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    // Cold start: the connection already existed, so it is seeded from the
+    // owner table rather than opened by an event, and no 3008 will ever
+    // describe it — the resolution happened before the session did.
+    const seeded = [_]tables.SeededConn{.{
+        .pid = 100,
+        .key = event.connKey(testEvent(.connect, .tcp, 100, 0, 51000)),
+    }};
+    try core.reconcile(&seeded, 0);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try std.testing.expectEqual(@as(?[]const u8, null), firstFlow(snap, 100).remote_hostname);
+    }
+
+    // The probe lands and names the Flow that was already open.
+    core.applyCompletion(try cacheCompletion(&.{.{
+        .ip = test_remote,
+        .name = "pre-start.example.test",
+        .alias = "cdn.example.test",
+    }}), 100);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const flow = firstFlow(snap, 100);
+    // Dimmed, and badged: `.cache` is what the UI renders that way.
+    try expectHostname("pre-start.example.test", .cache, flow);
+    try std.testing.expectEqualStrings("cdn.example.test", flow.remote_alias.?);
+}
+
+test "a cached name serves Flows opened after the snapshot too, without a lookup" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const lane = try attachTestLane(&core, "should-not-be-asked.test");
+    defer detachTestLane(lane);
+
+    core.applyCompletion(try cacheCompletion(&.{
+        .{ .ip = test_remote, .name = "pre-start.example.test" },
+    }), 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 100);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try expectHostname("pre-start.example.test", .cache, firstFlow(snap, 100));
+    }
+
+    // A dimmed name is still a name: the reverse lane is never asked about an
+    // address the cache already covered.
+    try core.tick(hostnames.reverse_grace_ms + 1_000);
+    try std.testing.expectEqual(@as(u32, 0), test_reverse_calls);
+}
+
+test "the startup probe is posted to the resolver lane, not run on the Engine thread" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    core.requestDnsCache();
+
+    // What keeps it off the Engine thread is that Core only ever *asks*: the
+    // request sits in the outbox until the runner hands it to the lane.
+    var asked = false;
+    for (core.outbox.items) |req| if (req == .dns_cache) {
+        asked = true;
+    };
+    try std.testing.expect(asked);
+}
+
+test "one snapshot names every Flow waiting on it, whichever address each has" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    // Two Flows, two different pre-start addresses, one snapshot carrying
+    // both — the batch shape the startup probe actually delivers.
+    try core.applyEvent(testEventTo(.connect, 100, 51000, test_remote), 0);
+    try core.applyEvent(testEventTo(.connect, 200, 51001, other_remote), 0);
+    core.applyCompletion(try cacheCompletion(&.{
+        .{ .ip = test_remote, .name = "first.example.test" },
+        .{ .ip = other_remote, .name = "second.example.test" },
+    }), 100);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("first.example.test", .cache, firstFlow(snap, 100));
+    try expectHostname("second.example.test", .cache, firstFlow(snap, 200));
+}
+
+test "the probe's own 3008 echo never launders a cache hint into an observation" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.self_pid = 4242;
+
+    core.applyCompletion(try cacheCompletion(&.{
+        .{ .ip = test_remote, .name = "pre-start.example.test" },
+    }), 0);
+
+    // Reading the cache makes the resolver report every cached name back to
+    // us as a completed resolution, in this process. Taken at face value it
+    // would occupy the global tier and re-render the whole snapshot plain and
+    // unbadged — a claim that some process resolved the address, sourced from
+    // zPulsar reading a cache.
+    try core.applyDns(dnsEvent(4242, "pre-start.example.test", &.{test_remote}), 50);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 100);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try expectHostname("pre-start.example.test", .cache, firstFlow(snap, 100));
+    }
+
+    // The same name from any other process is a real observation and wins.
+    try core.applyDns(dnsEvent(100, "pre-start.example.test", &.{test_remote}), 200);
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("pre-start.example.test", .observed, firstFlow(snap, 100));
+}
+
+test "a cache hint never outranks the name a process actually resolved" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    core.applyCompletion(try cacheCompletion(&.{
+        .{ .ip = test_remote, .name = "stale.example.test" },
+    }), 0);
+    // The observation arrives afterwards and takes over, in place.
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 100);
+    try core.applyDns(dnsEvent(100, "example.com", &.{test_remote}), 200);
+    {
+        const snap = try core.buildSnapshot(0);
+        defer snap.release();
+        try expectHostname("example.com", .observed, firstFlow(snap, 100));
+    }
+
+    // And a probe landing *after* an observation cannot pull it back down —
+    // a snapshot in flight while 3008s are already arriving is the ordinary
+    // startup race, not an exotic one.
+    core.applyCompletion(try cacheCompletion(&.{
+        .{ .ip = test_remote, .name = "stale.example.test" },
+    }), 300);
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("example.com", .observed, firstFlow(snap, 100));
+}
+
+test "a failed probe leaves pre-start names to the reverse-lookup lane" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    const lane = try attachTestLane(&core, "ec2-93-184-216-34.compute-1.test");
+    defer detachTestLane(lane);
+
+    // The cache could not be read: the completion carries nothing, and must
+    // record nothing — not a negative entry, which would suppress the
+    // fallback that is supposed to cover exactly this case.
+    core.applyCompletion(.{ .dns_cache = null }, 0);
+    try core.applyEvent(testEvent(.connect, .tcp, 100, 0, 51000), 0);
+
+    try core.tick(hostnames.reverse_grace_ms + 1);
+    lane.serviceOnce();
+    try core.tick(hostnames.reverse_grace_ms + 500);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    try expectHostname("ec2-93-184-216-34.compute-1.test", .reverse, firstFlow(snap, 100));
+}
+
+test "cache-derived entries idle out like every other tier" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+
+    core.applyCompletion(try cacheCompletion(&.{
+        .{ .ip = test_remote, .name = "busy.example.test" },
+        .{ .ip = other_remote, .name = "idle.example.test" },
+    }), 0);
+    // One address stays in use; nothing ever talks to the other.
+    try core.applyEvent(testEventTo(.connect, 100, 51000, test_remote), 0);
+
+    var now: u64 = 0;
+    while (now < hostnames.idle_expiry_ms + 60_000) : (now += 60_000) try core.tick(now);
+
+    try std.testing.expect(core.names.lookup(100, test_remote, now) != null);
+    // Gone with the sweep — a hint the cap or the clock takes costs a label,
+    // and the reverse lane is free to ask about the address again.
+    try std.testing.expectEqual(@as(?hostnames.Name, null), core.names.lookup(100, other_remote, now));
+    try std.testing.expect(core.names.wantsReverse(other_remote, now));
 }
 
 test "a late observation upgrades and un-dims the Flow in place; the first observed name is permanent" {

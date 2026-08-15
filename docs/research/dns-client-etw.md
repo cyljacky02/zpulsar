@@ -5,7 +5,7 @@ Date: 2026-08-14
 
 ## Verdict
 
-**Yes — the `Microsoft-Windows-DNS-Client` ETW provider delivers per-PID name-observed-at-lookup-time attribution, and cache hits are NOT silent.** Event **3008** (query completed) fires in the *calling process* for every completed `DnsQueryEx`/`getaddrinfo` resolution — **wire query, cache hit, or failure alike** — carrying the query name, result IPs (including CNAME chain), and status; the querying PID comes from the ETW event header. The charting stance (DNS-observation primary, async reverse lookup fallback) is workable. The real gaps are not cache hits but (a) names resolved *before zPulsar starts* (mitigated by a one-shot `MSFT_DnsClientCache` snapshot), and (b) processes that bypass the Windows resolver entirely — verified for `nslookup`, documented for Firefox DoH — which is exactly what the `GetNameInfoW` fallback is for. Event volume is trivial (~11 events/s total, ~4/s for 3006+3008, on an idle desktop; ~220 KB ETL per minute).
+**Yes — the `Microsoft-Windows-DNS-Client` ETW provider delivers per-PID name-observed-at-lookup-time attribution, and cache hits are NOT silent.** Event **3008** (query completed) fires in the *calling process* for every completed `DnsQueryEx`/`getaddrinfo` resolution — **wire query, cache hit, or failure alike** — carrying the query name, result IPs (including CNAME chain), and status; the querying PID comes from the ETW event header. The charting stance (DNS-observation primary, async reverse lookup fallback) is workable. The real gaps are not cache hits but (a) names resolved *before zPulsar starts* (mitigated by a one-shot resolver-cache snapshot — see §3, which reverses this doc's original recommendation of the WMI route), and (b) processes that bypass the Windows resolver entirely — verified for `nslookup`, documented for Firefox DoH — which is exactly what the `GetNameInfoW` fallback is for. Event volume is trivial (~11 events/s total, ~4/s for 3006+3008, on an idle desktop; ~220 KB ETL per minute).
 
 Method note: primary sources are (1) the provider's **registered manifest dumped from this machine** (`wevtutil gp Microsoft-Windows-DNS-Client` / `Get-WinEvent -ListProvider`, dnsapi.dll 10.0.26100.1591, Windows 11 26200), (2) **controlled live ETW traces** captured with `logman -ets` + `tracerpt` during scripted resolutions, and (3) Microsoft Learn documentation. Claims that could not be traced to one of these are marked **unverified**.
 
@@ -60,7 +60,38 @@ Corroboration: Microsoft's Sysmon documentation for Event ID 22 (DNSEvent, which
 
 ### Names resolved before zPulsar starts
 
-No retroactive events exist. Mitigation: snapshot the resolver cache once at startup via the documented **`MSFT_DnsClientCache`** CIM class (`root\StandardCimv2`; surfaced by `Get-DnsClientCache`), which returns `Entry, Name, Type, Data, TimeToLive, Status, Section` per record — enough to pre-populate the IP→name table (with TTLs, but **without PID attribution**; mark such entries "cache-derived"): <https://learn.microsoft.com/en-us/powershell/module/dnsclient/get-dnsclientcache>. (The `DnsGetCacheDataTable` export of dnsapi.dll returns the same data natively but is **undocumented** — prefer a one-shot WMI/CIM query despite the extra plumbing.)
+No retroactive events exist. Mitigation: snapshot the resolver cache once at startup — enough to pre-populate the IP→name table, but **without PID attribution**, so such entries must be marked "cache-derived".
+
+> **Reversal (issue #34).** This section originally recommended the documented **`MSFT_DnsClientCache`** CIM class (`root\StandardCimv2`; surfaced by `Get-DnsClientCache`) over dnsapi's undocumented `DnsGetCacheDataTable`. Implementing it showed the documented route is unusable for this purpose, and zPulsar now takes the undocumented one. The measurement is below; the class name, incidentally, is `MSFT_DNSClientCache` in the MOF.
+
+**Reading the cache is not side-effect free, by any route.** The resolver reports a cache read back as *resolutions*: one 3008 per cached name, in whatever process performed the read.
+
+Measured on Windows 11 26200, with the zPulsar rig tracing and its own probe disabled. Nothing resembling a burst appeared until `Get-DnsClientCache` was run by hand at t≈8 s; a WMI provider host then emitted a 3008 for **every** cached name inside a single millisecond:
+
+```
+ 9625  4520    ntp.ubuntu.com          <- ordinary background traffic
+11375  2212    api.anthropic.com   \
+11375  2212    chatgpt.com          |  one WmiPrvSE.exe (pid 2212), one
+11375  2212    llvm.org             |  millisecond, the whole cache
+11375  2212    pypi.org             |
+11375  2212    time.cloudflare.com /
+```
+
+Why it matters: those events are indistinguishable from genuine observations, so they land in the **global (tier 2) name cache**, which outranks the cache-derived hint tier and which `flows.applyName` lets upgrade over a hint. The snapshot's own `[cache]` marking is therefore erased by the act of taking it — pre-start names render plain and undimmed, asserting that a process resolved the address when the only thing that happened is zPulsar reading a cache. Verified end to end: a raw-IP connect to a cached address (no DNS lookup by the connecting process at all) displayed the name with no badge.
+
+Both routes provoke the echo; they differ only in **whose PID it wears**:
+
+| | data source | echo attributed to |
+|---|---|---|
+| `MSFT_DNSClientCache` | provider re-queries each entry | `WmiPrvSE.exe` — a shared host the Engine cannot identify, doing work for arbitrary callers |
+| `DnsGetCacheDataTable` + `DnsQuery_W` | our own calls | **this process** — one PID comparison suppresses it exactly |
+
+Hence the reversal. `DnsGetCacheDataTable` fills a linked list of `DNS_CACHE_ENTRY` (`next`, `name`, `wType`, `wDataLength`, `dwFlags`; 24 bytes on x64) and carries **names and record types only, no data**, so the addresses come from a per-name `DnsQuery_W` — which is documented. The undocumented surface is one export and one struct.
+
+Two further findings from that work:
+
+- **`DNS_QUERY_NO_WIRE_QUERY` does not read the machine's cache.** It consults only the calling process's own cache plus the hosts file. In a freshly started process it answers `DNS_INFO_NO_RECORDS` (9701) for every real name; after one standard query for the same name it succeeds. So the probe must issue *standard* queries, and a name whose entry expires between the table walk and the query goes to the wire — a handful of lookups at worst, for names the machine resolved moments ago.
+- The cache lists `(name, type)` pairs including negative entries and the PTR records the reverse-lookup lane leaves behind; only A (1) and AAAA (28) name an address. A standard query for an A record returns its CNAME chain alongside, and each address record's owner name is the chain's tail — the same shape 3008's `QueryResults` carries, so the CNAME tail survives into the hint.
 
 ## 4. `QueryResults` / `QueryStatus` wire format (verified live)
 
@@ -77,7 +108,7 @@ Per accepted 3008 (`QueryStatus==0`, non-empty results): parse `QueryResults`, k
 
 1. **Tier 1 — per-process map** `(PID, IP) → {name, lastSeen}`. Authoritative: "the name this process actually resolved." Handles multiple processes resolving the same IP under different names (CDN/SNI reality). Flow attribution: exact `(flow.pid, flow.remoteIP)` hit.
 2. **Tier 2 — global map** `IP → {name, lastSeen}` (last-writer-wins). Fallback for flows whose PID never emitted a 3008 for that IP (e.g. the name was resolved by a parent/helper process, or connection handed off). Display normally but attribution is inferred.
-3. **Tier 3 — startup cache snapshot** (`MSFT_DnsClientCache`, no PID) and, after that, **reverse-lookup results** (section 7). Both visually distinguished.
+3. **Tier 3 — startup cache snapshot** (§3, no PID) and, after that, **reverse-lookup results** (section 7). Both visually distinguished.
 
 Precedence on lookup: Tier 1 → Tier 2 → Tier 3 → raw IP.
 
@@ -114,7 +145,8 @@ Precedence on lookup: Tier 1 → Tier 2 → Tier 3 → raw IP.
 - ENABLE_TRACE_PARAMETERS / event-ID filters: <https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-enable_trace_parameters>
 - Sysmon Event ID 22 (cached-or-not, Windows 8.1+): <https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon#event-id-22-dnsevent-dns-query>
 - GetNameInfoW (sync-only, NI_NAMEREQD, WSAHOST_NOT_FOUND, "hint" caveat): <https://learn.microsoft.com/en-us/windows/win32/api/ws2tcpip/nf-ws2tcpip-getnameinfow>
-- Get-DnsClientCache / MSFT_DnsClientCache: <https://learn.microsoft.com/en-us/powershell/module/dnsclient/get-dnsclientcache>
+- Get-DnsClientCache / MSFT_DNSClientCache (the route §3 rejects, kept for the class shape): <https://learn.microsoft.com/en-us/powershell/module/dnsclient/get-dnsclientcache>
+- DnsQuery_W and its options: <https://learn.microsoft.com/en-us/windows/win32/api/windns/nf-windns-dnsquery_w>
 - Firefox TRR/DoH bypasses native resolver: <https://wiki.mozilla.org/Trusted_Recursive_Resolver>
 - SilkETW (real consumer of this provider): <https://github.com/mandiant/SilkETW>
 - Corroboration (secondary), 3008 on Windows 10 in 2019: <https://blog.davidvassallo.me/2019/04/19/monitoring-dns-requests-with-powershell/>
