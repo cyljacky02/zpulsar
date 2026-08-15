@@ -133,6 +133,7 @@ pub const Ledger = struct {
             .max_size_content = .height(0),
         });
         defer grid.deinit();
+        floorColumnWidths(&grid);
 
         // The Ordering is the source of truth; the header only displays it and
         // reports clicks. Writing it back each frame is also what keeps the
@@ -166,6 +167,30 @@ pub const Ledger = struct {
         for (first..last) |row| {
             if (row >= lines.len) break;
             self.cells(&grid, row, lines[row], snap, hovered);
+        }
+    }
+
+    /// Hold every column at the width its contents need.
+    ///
+    /// A header divider can be dragged, and dvui will take a column all the
+    /// way down to its own 6 px floor. That is a one-way door: a column's
+    /// share of the table's spare width is weighted *by its current width*
+    /// (`GridWidget.colWeight`), so a column at the floor has zero weight and
+    /// can never grow back — not by widening the window, not by dragging.
+    /// The column is gone for the rest of the session, and a Ledger missing
+    /// its Down column is a Ledger missing the number it exists to show.
+    ///
+    /// So the widths dvui remembers are floored here, every frame, at what
+    /// each column declares it needs. Columns stay resizable above that, and
+    /// a window too narrow to fit them all still shrinks them together —
+    /// dvui scales all six down for display and leaves these stored widths
+    /// alone, so they come back the moment there is room.
+    fn floorColumnWidths(grid: *dvui.GridWidget) void {
+        // Empty until dvui has seen the columns once, which is the frame
+        // before there is anything to hold up.
+        for (columns, 0..) |column, col| {
+            if (col >= grid.col_widths.len) break;
+            grid.col_widths[col] = @max(grid.col_widths[col], column.min_width);
         }
     }
 
