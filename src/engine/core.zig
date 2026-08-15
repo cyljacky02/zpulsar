@@ -26,6 +26,7 @@ const device_map = @import("device_map.zig");
 const dns_cache = @import("dns_cache.zig");
 const event = @import("event.zig");
 const flows = @import("flows.zig");
+const group_addr = @import("group_addr.zig");
 const hostnames = @import("hostnames.zig");
 const rates = @import("rates.zig");
 const resolver = @import("resolver.zig");
@@ -187,6 +188,12 @@ pub const Core = struct {
     outbox: std.ArrayList(resolver.Request) = .empty,
     /// When the Engine may next re-enumerate the SCM.
     map_refresh: MapRefresh = .{},
+    /// This machine's unicast addresses and prefixes, refreshed by the runner
+    /// on the sweep — the only way to recognize a subnet-directed broadcast
+    /// (ADR-0004). Empty until the first fetch, and left at its last good
+    /// value when one fails: classification then covers multicast only, which
+    /// is exactly the behaviour that predates the ADR.
+    prefixes: group_addr.LocalPrefixes = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Core {
         return .{ .gpa = gpa };
@@ -207,6 +214,15 @@ pub const Core = struct {
         self.reverse_scratch.deinit(self.gpa);
         self.service_names.deinit(self.gpa);
         self.outbox.deinit(self.gpa);
+        self.prefixes.deinit(self.gpa);
+    }
+
+    /// Replace the prefix table with a freshly fetched one, freeing the old.
+    /// Only called with a successful fetch: a failed one keeps what we have,
+    /// so classification degrades to multicast-only rather than to nothing.
+    pub fn setPrefixes(self: *Core, fresh: group_addr.LocalPrefixes) void {
+        self.prefixes.deinit(self.gpa);
+        self.prefixes = fresh;
     }
 
     /// Apply one net-event ring record. OOM drops the record — the caller
@@ -231,7 +247,7 @@ pub const Core = struct {
                 row.rate.add(at, sent, recv);
                 // First activity opens the Flow (raced the table snapshot,
                 // or a new Generation after closure).
-                const key = flows.flowKey(ev);
+                const key = flows.flowKey(ev, self.prefixes);
                 const live = try self.flows.touch(
                     self.gpa,
                     key,
@@ -242,18 +258,21 @@ pub const Core = struct {
                 live.sent += sent;
                 live.recv += recv;
                 live.rate.add(at, sent, recv);
+                // The key vacated the Group Address from the local endpoint;
+                // the event still has it, so carry it for display (ADR-0004).
+                if (key.tuple.group_kind != .none) live.group_addr = ev.local_addr;
                 if (live.resolution == .unclassified) self.classify(key, live, now_ms);
                 self.dirty = true;
             },
             .connect => {
                 const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
-                const key = flows.flowKey(ev);
+                const key = flows.flowKey(ev, self.prefixes);
                 const live = try self.flows.connect(self.gpa, key, idx, now_ms, &self.names);
                 if (live.resolution == .unclassified) self.classify(key, live, now_ms);
                 self.dirty = true;
             },
             .disconnect => {
-                if (try self.flows.close(self.gpa, flows.flowKey(ev), now_ms))
+                if (try self.flows.close(self.gpa, flows.flowKey(ev, self.prefixes), now_ms))
                     self.dirty = true;
             },
         }
@@ -274,7 +293,7 @@ pub const Core = struct {
     fn applyIcmp(self: *Core, ev: event.NetEvent, now_ms: u64) error{OutOfMemory}!void {
         if (ev.op == .send) {
             const idx = try self.rowForTraffic(ev.pid, ev.timestamp_ft);
-            const key = flows.flowKey(ev);
+            const key = flows.flowKey(ev, self.prefixes);
             const live = try self.flows.touch(self.gpa, key, idx, now_ms, &self.names);
             live.msgs_sent += 1;
             notePeer(live, ev.remote_addr);
@@ -992,7 +1011,7 @@ pub const Core = struct {
                     only_service;
                 if (!f.lingering) switch (f.proto) {
                     .tcp => dst.tcp_conns += 1,
-                    .udp => dst.udp_socks += 1,
+                    .udp => dst.udp_flows += 1,
                     .icmp => dst.icmp_flows += 1,
                 };
             }
@@ -1151,7 +1170,7 @@ test "send and recv accumulate independent u64 totals per payload PID" {
     const p200 = rowForPid(snap.rows, 200).?;
     try std.testing.expectEqual(@as(u64, 0), p200.sent);
     try std.testing.expectEqual(@as(u64, 7), p200.recv);
-    try std.testing.expectEqual(@as(u32, 1), p200.udp_socks);
+    try std.testing.expectEqual(@as(u32, 1), p200.udp_flows);
     // Rows come out sorted by PID.
     try std.testing.expect(snap.rows[0].pid < snap.rows[1].pid);
 }
@@ -1198,7 +1217,7 @@ test "events racing the snapshot dedupe by normalized 5-tuple" {
     try core.reconcile(&.{.{ .pid = 300, .key = event.connKey(udp_data) }}, 0);
     const snap2 = try core.buildSnapshot(0);
     defer snap2.release();
-    try std.testing.expectEqual(@as(u32, 1), rowForPid(snap2.rows, 300).?.udp_socks);
+    try std.testing.expectEqual(@as(u32, 1), rowForPid(snap2.rows, 300).?.udp_flows);
 }
 
 test "disconnect closes the connection but totals persist" {
@@ -1515,8 +1534,274 @@ test "one UDP socket talking to two remotes is two Flows" {
     // The Flow key keeps UDP's real remote endpoint (spec issue #18 Data
     // model) — unlike the local-only table-dedupe key.
     try std.testing.expectEqual(@as(usize, 2), row.flows.len);
-    try std.testing.expectEqual(@as(u32, 2), row.udp_socks);
+    try std.testing.expectEqual(@as(u32, 2), row.udp_flows);
     try std.testing.expect(row.flows[0].remote_port != row.flows[1].remote_port);
+}
+
+// ---------------------------------------------------------------------------
+// Group Addresses (ADR-0004). The machine under test is the one from #41:
+// a /24 LAN and a /20 WSL bridge, and Spotify's discovery traffic on 57621.
+// ---------------------------------------------------------------------------
+
+fn ip4(a: u8, b: u8, c: u8, d: u8) [16]u8 {
+    return [4]u8{ a, b, c, d } ++ @as([12]u8, @splat(0));
+}
+
+const spotify_nics: group_addr.LocalPrefixes = .borrow(&.{
+    .{ .family = .v4, .addr = ip4(192, 168, 88, 254), .prefix_len = 24 },
+    .{ .family = .v4, .addr = ip4(172, 17, 64, 1), .prefix_len = 20 },
+});
+
+/// A UDP datagram as the provider reports it: receives are packet-oriented, so
+/// `local_addr` is the datagram's *destination* — which is the whole reason a
+/// Group Address turns up in the local endpoint (research §2.5).
+fn udpEvent(
+    op: event.Op,
+    pid: u32,
+    local_addr: [16]u8,
+    remote_addr: [16]u8,
+    port: u16,
+) event.NetEvent {
+    return .{
+        .op = op,
+        .proto = .udp,
+        .family = .v4,
+        .icmp_type = 0,
+        .pid = pid,
+        .size = 88,
+        .local_addr = local_addr,
+        .remote_addr = remote_addr,
+        .local_port = port,
+        .remote_port = port,
+        .timestamp_ft = 0,
+    };
+}
+
+fn onlyFlow(snap: *snapshot.Snapshot, pid: u32) snapshot.Flow {
+    const row = rowForPid(snap.rows, pid).?;
+    std.debug.assert(row.flows.len == 1);
+    return row.flows[0];
+}
+
+test "a group-addressed receive never keeps the group as its local endpoint" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    // A directed broadcast encodes its subnet, so the receiving interface is
+    // derivable and the local endpoint becomes a real, bindable address.
+    try core.applyEvent(
+        udpEvent(.recv, 5136, ip4(192, 168, 88, 255), ip4(192, 168, 88, 7), 57621),
+        0,
+    );
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const bcast = onlyFlow(snap, 5136);
+    try std.testing.expectEqual(event.GroupKind.broadcast, bcast.group_kind);
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 254), &bcast.local_addr);
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 255), &bcast.group_addr);
+    // The sender is untouched — Hostname Attribution keys on it.
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 7), &bcast.remote_addr);
+    try std.testing.expectEqual(@as(u16, 57621), bcast.local_port);
+
+    // Multicast encodes no subnet, so the interface stays unknowable and the
+    // local address is the unspecified one — never the group.
+    var core2 = Core.init(std.testing.allocator);
+    defer core2.deinit();
+    core2.prefixes = spotify_nics;
+    try core2.applyEvent(
+        udpEvent(.recv, 900, ip4(224, 0, 0, 251), ip4(192, 168, 88, 7), 5353),
+        0,
+    );
+    const snap2 = try core2.buildSnapshot(0);
+    defer snap2.release();
+    const mcast = onlyFlow(snap2, 900);
+    try std.testing.expectEqual(event.GroupKind.multicast, mcast.group_kind);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &mcast.local_addr);
+    try std.testing.expectEqualSlices(u8, &ip4(224, 0, 0, 251), &mcast.group_addr);
+    try std.testing.expectEqual(@as(u16, 5353), mcast.local_port);
+}
+
+test "a group receive and a unicast receive from one peer are two Flows" {
+    // Once a directed broadcast's local side resolves to the interface's own
+    // address, the two are identical in every other field — group_kind is the
+    // only thing keeping a discovery protocol's broadcast and its unicast
+    // reply from collapsing into one Flow.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const peer = ip4(192, 168, 88, 7);
+    try core.applyEvent(udpEvent(.recv, 5136, ip4(192, 168, 88, 255), peer, 57621), 0);
+    try core.applyEvent(udpEvent(.recv, 5136, ip4(192, 168, 88, 254), peer, 57621), 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 5136).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try std.testing.expectEqual(@as(u32, 2), row.udp_flows);
+    // Same local endpoint, same peer, same ports — they differ only in kind.
+    try std.testing.expectEqualSlices(u8, &row.flows[0].local_addr, &row.flows[1].local_addr);
+    try std.testing.expect(row.flows[0].group_kind != row.flows[1].group_kind);
+}
+
+test "a UDP send to a group is left exactly as it was (issue #41)" {
+    // The send path is endpoint-oriented: its local side is the socket's own
+    // address and the group sits in the remote, where a destination belongs.
+    // Nothing to vacate, so nothing is rewritten and no badge is carried.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    try core.applyEvent(
+        udpEvent(.send, 5136, ip4(192, 168, 88, 254), ip4(192, 168, 88, 255), 57621),
+        0,
+    );
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const f = onlyFlow(snap, 5136);
+    try std.testing.expectEqual(event.GroupKind.none, f.group_kind);
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 254), &f.local_addr);
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 255), &f.remote_addr);
+    try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), &f.group_addr);
+}
+
+test "broadcasting and hearing yourself is two Flows, oriented (issue #41)" {
+    // The #41 report, reproduced: Spotify's socket is bound 0.0.0.0:57621 and
+    // hears its own broadcast, so both Flows name this machine. Before the
+    // ADR the receive read `192.168.88.255 -> 192.168.88.254`, a local
+    // endpoint no socket could have bound.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const us = ip4(192, 168, 88, 254);
+    const group = ip4(192, 168, 88, 255);
+    try core.applyEvent(udpEvent(.send, 5136, us, group, 57621), 0);
+    try core.applyEvent(udpEvent(.recv, 5136, group, us, 57621), 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 5136).?;
+    // Genuinely different endpoint pairs, unlike the #36 mirroring — so still
+    // two Flows, and udp_flows counts both.
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    try std.testing.expectEqual(@as(u32, 2), row.udp_flows);
+    for (row.flows) |f| {
+        // Whichever half this is, its local endpoint is now bindable.
+        try std.testing.expectEqualSlices(u8, &us, &f.local_addr);
+        switch (f.group_kind) {
+            .none => try std.testing.expectEqualSlices(u8, &group, &f.remote_addr),
+            .broadcast => {
+                try std.testing.expectEqualSlices(u8, &us, &f.remote_addr);
+                try std.testing.expectEqualSlices(u8, &group, &f.group_addr);
+            },
+            .multicast => unreachable,
+        }
+    }
+}
+
+test "a group Flow covers its bound socket, so the sweep seeds no duplicate" {
+    // presenceTuple drops a group Flow's local address (ADR-0004): the
+    // interface a datagram arrived on is not the address a wildcard-bound
+    // socket registered. Without that, reconcile would see the table's
+    // 0.0.0.0:5353 row as uncovered and seed a second Flow beside the real one.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const bound: event.ConnKey = .{
+        .proto = .udp,
+        .family = .v4,
+        .local_addr = @splat(0),
+        .remote_addr = @splat(0),
+        .local_port = 5353,
+        .remote_port = 0,
+    };
+    try core.reconcile(&.{.{ .pid = 900, .key = bound }}, 0);
+    try core.applyEvent(
+        udpEvent(.recv, 900, ip4(224, 0, 0, 251), ip4(192, 168, 88, 7), 5353),
+        0,
+    );
+    // The real conversation supersedes the seeded placeholder…
+    try core.reconcile(&.{.{ .pid = 900, .key = bound }}, 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const f = onlyFlow(snap, 900); // …and the sweep adds nothing back.
+    try std.testing.expectEqual(event.GroupKind.multicast, f.group_kind);
+}
+
+test "a directed broadcast supersedes its wildcard-bound socket's placeholder" {
+    // Found on the rig, not in a test: a directed broadcast resolves its local
+    // side to the interface address, so looking the placeholder up by that
+    // address misses the `0.0.0.0` one the socket actually registered, and
+    // Spotify showed `0.0.0.0:57621 -> *` sitting beside its own conversation.
+    // Multicast never had the problem — its local side is already zero — which
+    // is exactly why the multicast test above passed while this was broken.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const bound: event.ConnKey = .{
+        .proto = .udp,
+        .family = .v4,
+        .local_addr = @splat(0),
+        .remote_addr = @splat(0),
+        .local_port = 57621,
+        .remote_port = 0,
+    };
+    try core.reconcile(&.{.{ .pid = 5136, .key = bound }}, 0);
+    try core.applyEvent(
+        udpEvent(.recv, 5136, ip4(192, 168, 88, 255), ip4(192, 168, 88, 254), 57621),
+        0,
+    );
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const f = onlyFlow(snap, 5136);
+    try std.testing.expectEqual(event.GroupKind.broadcast, f.group_kind);
+    try std.testing.expectEqualSlices(u8, &ip4(192, 168, 88, 254), &f.local_addr);
+}
+
+test "a specifically-bound socket shows the extra row ADR-0004 accepts" {
+    // The other side of the under-claim above. presenceTuple cannot know which
+    // address the socket bound, so a socket bound to a concrete address has
+    // its table row seeded beside the group Flow. That extra row is a real
+    // bound socket — the deliberate cost of never claiming coverage of an
+    // endpoint the Flow may not own.
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    core.prefixes = spotify_nics;
+
+    const bound: event.ConnKey = .{
+        .proto = .udp,
+        .family = .v4,
+        .local_addr = ip4(192, 168, 88, 254),
+        .remote_addr = @splat(0),
+        .local_port = 5353,
+        .remote_port = 0,
+    };
+    try core.reconcile(&.{.{ .pid = 901, .key = bound }}, 0);
+    try core.applyEvent(
+        udpEvent(.recv, 901, ip4(224, 0, 0, 251), ip4(192, 168, 88, 7), 5353),
+        0,
+    );
+    try core.reconcile(&.{.{ .pid = 901, .key = bound }}, 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    const row = rowForPid(snap.rows, 901).?;
+    try std.testing.expectEqual(@as(usize, 2), row.flows.len);
+    var groups: usize = 0;
+    var placeholders: usize = 0;
+    for (row.flows) |f| {
+        if (f.group_kind == .multicast) groups += 1;
+        // The seeded row is the socket itself: bound address, no peer.
+        if (f.group_kind == .none and f.remote_port == 0) placeholders += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), groups);
+    try std.testing.expectEqual(@as(usize, 1), placeholders);
 }
 
 test "UDP Flows age out after 60 s inactivity into normal Linger" {
@@ -1537,7 +1822,7 @@ test "UDP Flows age out after 60 s inactivity into normal Linger" {
     defer snap2.release();
     const row2 = rowForPid(snap2.rows, 300).?;
     try std.testing.expect(row2.flows[0].lingering);
-    try std.testing.expectEqual(@as(u32, 0), row2.udp_socks);
+    try std.testing.expectEqual(@as(u32, 0), row2.udp_flows);
 
     // …and 10 s later it leaves, bytes retained in the row.
     try core.tick(100_000);

@@ -11,6 +11,7 @@ const consumer_mod = @import("consumer.zig");
 const core_mod = @import("core.zig");
 const device_map = @import("device_map.zig");
 const etw_session = @import("etw_session.zig");
+const group_addr = @import("group_addr.zig");
 const rates = @import("rates.zig");
 const resolver = @import("resolver.zig");
 const reverse_lookup = @import("reverse_lookup.zig");
@@ -137,6 +138,12 @@ pub const Engine = struct {
 
         try cons.open();
         errdefer cons.close();
+
+        // Before any event is classified: without the prefix table a
+        // subnet-directed broadcast is indistinguishable from a host address
+        // (ADR-0004), so the first datagrams would key as unicast and, being a
+        // different identity, never merge with the Flow later ones open.
+        self.refreshPrefixes();
 
         // Cold start: seed pre-existing connections while events pile up in
         // the session's buffers behind the just-opened handle.
@@ -354,9 +361,21 @@ pub const Engine = struct {
     /// lost, keep seeded sockets honest. A failed round is skipped — the
     /// next sweep retries.
     fn sweep(self: *Engine, now_ms: u64) void {
+        self.refreshPrefixes();
         const rows = tables.snapshotConnections(self.gpa) catch return;
         defer self.gpa.free(rows);
         self.core.reconcile(rows, now_ms) catch {};
+    }
+
+    /// Re-read this machine's addresses and prefixes (ADR-0004). A failure
+    /// keeps the last good table rather than clearing it: an empty table
+    /// classifies directed broadcasts as unicast, so discarding one on a
+    /// transient failure would split a live Flow's identity mid-conversation.
+    /// Addresses change on the order of a VPN or a dock, so the 10 s sweep is
+    /// ample and nothing here is on the event path.
+    fn refreshPrefixes(self: *Engine) void {
+        const fresh = group_addr.fetch(self.gpa) catch return;
+        self.core.setPrefixes(fresh);
     }
 
     /// Unified loss recovery (ADR-0002): re-baseline the Flow list from

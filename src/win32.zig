@@ -166,6 +166,39 @@ pub const TCPIP_OWNER_MODULE_INFO_CLASS = ip_helper.TCPIP_OWNER_MODULE_INFO_CLAS
 pub const TCPIP_OWNER_MODULE_INFO_BASIC = TCPIP_OWNER_MODULE_INFO_CLASS.C;
 
 // ---------------------------------------------------------------------------
+// IP Helper — local unicast addresses and their on-link prefixes
+// (Group Address classification, ADR-0004)
+// ---------------------------------------------------------------------------
+
+/// A subnet-directed broadcast address (`192.168.88.255`) is only recognisable
+/// as one against the prefix length of the interface it belongs to, which no
+/// event payload carries. `GetUnicastIpAddressTable` is the narrow way to get
+/// it: a flat table, unlike `GetAdaptersAddresses`' linked list, and it
+/// allocates — every successful call must be paired with `FreeMibTable`.
+pub const GetUnicastIpAddressTable = zigwin32.iphlpapi.GetUnicastIpAddressTable;
+pub const FreeMibTable = zigwin32.iphlpapi.FreeMibTable;
+
+pub const MIB_UNICASTIPADDRESS_ROW = ip_helper.MIB_UNICASTIPADDRESS_ROW;
+pub const MIB_UNICASTIPADDRESS_TABLE = ip_helper.MIB_UNICASTIPADDRESS_TABLE;
+
+/// The row's address is a `SOCKADDR_INET` union: read `si_family` to pick the
+/// arm, then the v4 or v6 bytes, which are already network order. `si_family`
+/// is the typed `ADDRESS_FAMILY`, so the arm test compares against
+/// `AF_INET_FAMILY`/`AF_INET6_FAMILY` below, not a bare integer.
+pub const SOCKADDR_INET = win_sock.SOCKADDR_INET;
+
+/// `GetUnicastIpAddressTable` returns NTSTATUS, not the `u32` WIN32_ERROR the
+/// extended-table calls use. The pinned binding types it as std's enum rather
+/// than the raw `i32` the SDK declares.
+pub const NTSTATUS = std.os.windows.NTSTATUS;
+pub const STATUS_SUCCESS: NTSTATUS = .SUCCESS;
+
+/// `GetUnicastIpAddressTable` takes the typed `ADDRESS_FAMILY` (declared with
+/// the reverse-lookup helpers below), unlike the extended-table calls above
+/// which take a bare `u32`. AF_UNSPEC fetches both families in one call.
+pub const AF_UNSPEC = win_sock.AF_UNSPEC;
+
+// ---------------------------------------------------------------------------
 // Service Control Manager (advapi32) — the PID → hosted-services map
 // (Service Attribution tier 1 and the tier 3 fallback list, issue #25)
 // ---------------------------------------------------------------------------
@@ -549,6 +582,19 @@ comptime {
     assert(@offsetOf(MIB_TCP6TABLE_OWNER_MODULE, "table") == 8);
     assert(@offsetOf(MIB_UDPTABLE_OWNER_MODULE, "table") == 8);
     assert(@offsetOf(MIB_UDP6TABLE_OWNER_MODULE, "table") == 8);
+
+    // netioapi.h MIB_UNICASTIPADDRESS_ROW / MIB_UNICASTIPADDRESS_TABLE.
+    // SOCKADDR_INET is 28 bytes (the sockaddr_in6 arm) and 4-aligned, so the
+    // 8-aligned NET_LUID that follows forces 4 bytes of padding — which is
+    // what puts OnLinkPrefixLength, the only field ADR-0004 needs, at 60.
+    assert(@sizeOf(SOCKADDR_INET) == 28);
+    assert(@sizeOf(MIB_UNICASTIPADDRESS_ROW) == 80);
+    assert(@offsetOf(MIB_UNICASTIPADDRESS_ROW, "Address") == 0);
+    assert(@offsetOf(MIB_UNICASTIPADDRESS_ROW, "InterfaceLuid") == 32);
+    assert(@offsetOf(MIB_UNICASTIPADDRESS_ROW, "InterfaceIndex") == 40);
+    assert(@offsetOf(MIB_UNICASTIPADDRESS_ROW, "OnLinkPrefixLength") == 60);
+    assert(@offsetOf(MIB_UNICASTIPADDRESS_TABLE, "NumEntries") == 0);
+    assert(@offsetOf(MIB_UNICASTIPADDRESS_TABLE, "Table") == 8);
 
     // iphlpapi.h TCPIP_OWNER_MODULE_BASIC_INFO — two pointers into the
     // caller's buffer, which is why the buffer must outlive the strings.

@@ -175,7 +175,7 @@ fn writeTable(
         try w.print("{d:>8}  {d:>4}  {d:>4}  {d:>4}  {s:>12}  {s:>12}  {s:>12}  {s:>12}  {s}{s}{s}{s}", .{
             r.pid,
             r.tcp_conns,
-            r.udp_socks,
+            r.udp_flows,
             r.icmp_flows,
             fmtRate(r.recv_rate, &down_buf),
             fmtRate(r.sent_rate, &up_buf),
@@ -268,6 +268,7 @@ fn writeFlow(
     var dbuf: [20]u8 = undefined;
     var ubuf: [20]u8 = undefined;
     var svcbuf: [64]u8 = undefined;
+    var grpbuf: [64]u8 = undefined;
     const line_dim = vt and f.lingering;
     if (line_dim) try w.writeAll("\x1b[2m");
     try w.print("           {s} gen{d}  {s} -> {s}  ↓ {s} ↑ {s}  {s} / {s}", .{
@@ -280,6 +281,7 @@ fn writeFlow(
         fmtActivity(f, .sent, &sbuf),
         fmtActivity(f, .recv, &rvbuf),
     });
+    try w.writeAll(groupLabel(f, &grpbuf));
     try writeHostname(w, f, vt and !line_dim);
     try w.writeAll(flowServiceLabel(f, row, &svcbuf));
     if (f.lingering) try w.writeAll("  [linger]");
@@ -323,6 +325,24 @@ fn serviceLabel(r: engine.snapshot.Row, buf: []u8) []const u8 {
     }
     w.writeByte(')') catch {};
     return w.buffered();
+}
+
+/// The Group Address these datagrams arrived at (ADR-0004). Load-bearing, not
+/// decorative: it is the address vacated from the local endpoint, and without
+/// it a broadcast receive — whose local and remote can both be this machine —
+/// is inexplicable. Receive-only; a send addressed to a group already shows it
+/// as the remote endpoint, where it belongs.
+fn groupLabel(f: engine.snapshot.Flow, buf: []u8) []const u8 {
+    const kind = switch (f.group_kind) {
+        .none => return "",
+        .multicast => "mcast",
+        .broadcast => "bcast",
+    };
+    var abuf: [64]u8 = undefined;
+    return std.fmt.bufPrint(buf, "  [{s} {s}]", .{
+        kind,
+        fmtAddr(f.family, f.group_addr, null, &abuf),
+    }) catch "";
 }
 
 /// A Flow's own service. Only shared hosts need it: a single-service row
@@ -376,7 +396,9 @@ fn fmtEndpoint(f: engine.snapshot.Flow, side: Side, buf: []u8) []const u8 {
 }
 
 /// One address, with its port when the protocol has one (bracketed for v6).
-/// v6 prints full-form groups — it's a debug rig.
+/// A null port gives the bare address — what a Group Address badge shows,
+/// since the group's port is the socket's and is already on the local
+/// endpoint. v6 prints full-form groups — it's a debug rig.
 fn fmtAddr(family: engine.event.Family, addr: [16]u8, port: ?u16, buf: []u8) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     switch (family) {

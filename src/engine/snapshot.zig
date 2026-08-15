@@ -45,6 +45,14 @@ pub const Flow = struct {
     recv_rate: u64 = 0,
     /// Closed but still visible, dimmed (CONTEXT.md "Linger").
     lingering: bool = false,
+    /// Whether this Flow's datagrams arrived at a Group Address, and which
+    /// kind (CONTEXT.md "Group Address"; ADR-0004). Receive-only: a send
+    /// addressed to a group carries it in `remote_addr`, where it belongs.
+    group_kind: event.GroupKind = .none,
+    /// The group itself, when `group_kind` is not `.none` — the address
+    /// vacated from `local_addr`, without which a group Flow's local endpoint
+    /// is inexplicable. All-zero otherwise.
+    group_addr: [16]u8 = @splat(0),
     /// The name resolved once at Flow creation and stored (CONTEXT.md
     /// "Hostname Attribution"); null shows the bare endpoint. Arena-owned by
     /// this Snapshot.
@@ -86,9 +94,10 @@ pub const Row = struct {
     /// its Flows, so this survives their Linger and their eviction.
     sent_rate: u64 = 0,
     recv_rate: u64 = 0,
-    /// Live (non-Lingering) flow counts by protocol.
+    /// Live (non-Lingering) flow counts by protocol. All three count Flows,
+    /// not sockets: one socket talking to N remotes is N Flows (flows.zig).
     tcp_conns: u32 = 0,
-    udp_socks: u32 = 0,
+    udp_flows: u32 = 0,
     icmp_flows: u32 = 0,
     /// This row's Flows, live and Lingering — a slice of Snapshot.flows.
     flows: []const Flow = &.{},

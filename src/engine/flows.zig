@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const event = @import("event.zig");
+const group_addr = @import("group_addr.zig");
 const hostnames = @import("hostnames.zig");
 const rates = @import("rates.zig");
 const snapshot = @import("snapshot.zig");
@@ -45,20 +46,35 @@ pub const FlowKey = struct {
     pid: u32,
 };
 
-pub fn flowKey(ev: event.NetEvent) FlowKey {
+/// `prefixes` is this machine's unicast addresses, needed only to recognize a
+/// subnet-directed broadcast (ADR-0004); an empty table degrades to
+/// multicast-only classification rather than to a wrong answer.
+pub fn flowKey(ev: event.NetEvent, prefixes: group_addr.LocalPrefixes) FlowKey {
     // ICMP identity is (protocol, family, owning PID). The spec's original
     // key included the remote address, but under the session's `ut:Global`
     // keyword the send path logs no addresses at all, so an outbound message
     // cannot name its peer — see ADR-0003. The peer is learned from the
     // correlated replies and carried for display only.
     if (ev.proto == .icmp) return icmpKey(ev.family, ev.pid);
+
+    // A UDP receive is packet-oriented (research §2.5), so its local side is
+    // the datagram's own destination — which for a Group Address is not an
+    // address any socket bound. Vacate it; the group itself is carried on the
+    // Flow for display (ADR-0004). Only the receive path can produce this: a
+    // send is endpoint-oriented, and its group sits correctly in the remote.
+    const group: group_addr.Classified = if (ev.proto == .udp and ev.op == .recv)
+        group_addr.classify(prefixes, ev.family, ev.local_addr)
+    else
+        .{ .kind = .none, .local_addr = ev.local_addr };
+
     return .{ .pid = ev.pid, .tuple = .{
         .proto = ev.proto,
         .family = ev.family,
-        .local_addr = ev.local_addr,
+        .local_addr = group.local_addr,
         .remote_addr = ev.remote_addr,
         .local_port = ev.local_port,
         .remote_port = ev.remote_port,
+        .group_kind = group.kind,
     } };
 }
 
@@ -171,6 +187,10 @@ pub const Live = struct {
     /// ICMP only: the peer, learned from the replies this Flow correlated
     /// (ADR-0003) — display, never identity. All-zero until the first reply.
     icmp_remote: [16]u8 = @splat(0),
+    /// The Group Address the datagrams arrived at, when the key says this Flow
+    /// is group-addressed (ADR-0004) — display only, and the reason vacating
+    /// the local endpoint loses nothing. All-zero otherwise.
+    group_addr: [16]u8 = @splat(0),
     /// Event-time byte history behind this Flow's displayed speed. An ICMP
     /// Flow never buckets anything into it: it has no bytes to bucket.
     rate: rates.Ring = .{},
@@ -221,11 +241,22 @@ fn isZeroRemote(tuple: event.ConnKey) bool {
 
 /// A live Flow's presence at the granularity the owner tables know: TCP by
 /// full tuple, UDP collapsed to the local endpoint (event.connKey rules).
+///
+/// A group-addressed Flow drops its local address too (ADR-0004). Its local
+/// side is the interface a datagram arrived on, which is not necessarily the
+/// address the socket bound — a wildcard-bound socket is the common case, and
+/// the tables record the bind. Under-claiming here costs at most one extra row
+/// (a real socket, seeded as its own placeholder); over-claiming would let a
+/// Flow mask a socket nothing else is watching.
 fn presenceTuple(tuple: event.ConnKey) event.ConnKey {
     var t = tuple;
     if (t.proto == .udp) {
         t.remote_addr = @splat(0);
         t.remote_port = 0;
+    }
+    if (t.group_kind != .none) {
+        t.local_addr = @splat(0);
+        t.group_kind = .none;
     }
     return t;
 }
@@ -409,8 +440,14 @@ pub const Table = struct {
         now_ms: u64,
     ) error{OutOfMemory}!void {
         var placeholder = key;
-        placeholder.tuple.remote_addr = @splat(0);
-        placeholder.tuple.remote_port = 0;
+        // The placeholder is this Flow reduced to owner-table granularity —
+        // the same reduction the sweep compares against, so the two cannot
+        // disagree about which socket a Flow belongs to. It matters for a
+        // group Flow: a directed broadcast's local side is the interface it
+        // arrived on, while the socket that gets the datagram is usually bound
+        // to the wildcard, and looking up the resolved address would leave the
+        // real socket's placeholder sitting beside its own conversation.
+        placeholder.tuple = presenceTuple(key.tuple);
         const slot = self.slots.getPtr(placeholder) orelse return;
         if (slot.live == null) return;
         if (slot.live.?.sent + slot.live.?.recv > 0) {
@@ -935,6 +972,11 @@ pub const Table = struct {
                 .sent_rate = speed.sent,
                 .recv_rate = speed.recv,
                 .lingering = lingering,
+                // Like ICMP's peer above: the group is carried on the Flow,
+                // not in the identity, because the identity is where it could
+                // not honestly stay (ADR-0004).
+                .group_kind = key.tuple.group_kind,
+                .group_addr = flow.group_addr,
                 // Borrowed from the Table; the Snapshot build copies them into its
                 // own arena before publishing.
                 .remote_hostname = if (name.text.len > 0) name.text else null,

@@ -9,6 +9,12 @@ const std = @import("std");
 pub const Proto = enum(u8) { tcp, udp, icmp };
 pub const Family = enum(u8) { v4, v6 };
 
+/// Whether a datagram was addressed to a Group Address, and which kind
+/// (ADR-0004). Lives here rather than in group_addr.zig because it is part of
+/// `ConnKey` — the same reason `Proto` and `Family` do; group_addr.zig, which
+/// decides the value, re-exports it.
+pub const GroupKind = enum(u8) { none, multicast, broadcast };
+
 /// What the Engine does with the record: send/recv accumulate In-session
 /// Totals; connect/disconnect maintain the connection list. Events excluded
 /// from totals (retransmit, protocol copy) never become records at all.
@@ -176,8 +182,17 @@ pub const ConnKey = struct {
     remote_addr: [16]u8,
     local_port: u16,
     remote_port: u16,
+    /// Set only by `flows.flowKey`, which is where a Group Address is
+    /// recognized (ADR-0004). It keeps a group-addressed conversation distinct
+    /// from a unicast one with the same peer on the same ports — once a
+    /// directed broadcast's local side resolves to the interface's own
+    /// address, the two are otherwise identical.
+    group_kind: GroupKind = .none,
 };
 
+/// The table-dedupe key. Owner-table rows never describe a group — a socket
+/// binds an address, and the tables know nothing about what arrives at it — so
+/// `group_kind` stays `.none` here by construction.
 pub fn connKey(ev: NetEvent) ConnKey {
     return .{
         .proto = ev.proto,

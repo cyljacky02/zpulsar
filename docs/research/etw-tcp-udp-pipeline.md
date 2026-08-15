@@ -225,14 +225,22 @@ the provider. `parser.zig` encodes it once in `Class.orientation` and applies it
 
 **Nuance — broadcast and multicast receives.** Because a UDP receive reports the datagram's
 own destination, a datagram addressed to a broadcast or multicast group yields that group as
-the Flow's local endpoint (e.g. `192.168.88.255:57621`, `224.0.0.252:5355`) rather than a
-unicast address the socket could have bound. There is no better answer available: the
-payload carries no field for the receiving interface's unicast address, so anything else
-would be invented. The remote side — the only side Hostname Attribution keys on — is the
-actual sender, which is what matters. A consequence is that a process broadcasting and
-hearing its own datagram shows two Flows (`us → group` for the send, `group → us` for the
-receive); those are genuinely different endpoint pairs, not the #36 mirroring, which
-affected ordinary unicast conversations.
+the *packet's* local side (e.g. `192.168.88.255:57621`, `224.0.0.252:5355`) — not a unicast
+address the socket could have bound. Raised as [#41](https://github.com/cyljacky02/zpulsar/issues/41)
+and settled by [ADR-0004](../adr/0004-group-address-flow-identity.md): the group is vacated from
+the Flow's local endpoint and carried as an attribute. Read that ADR for the rule; what belongs
+here is only what the *trace* establishes.
+
+The payload carries no field for the receiving interface's unicast address, which is why this
+section originally recorded that no better answer was available. That was true of the payload
+and false of the engine: a subnet-directed broadcast address encodes its subnet, so joining it
+with the OS's prefix table names the receiving interface outright. Multicast and the limited
+broadcast address encode no subnet and remain genuinely unresolvable from the event.
+
+The remote side — the only side Hostname Attribution keys on — is the actual sender in every
+case. A process broadcasting and hearing its own datagram shows two Flows (`us → group` for the
+send, and a receive whose peer is itself); those are genuinely different endpoint pairs, not the
+#36 mirroring, which affected ordinary unicast conversations.
 
 ## 3. Real-time consumer mechanics
 
