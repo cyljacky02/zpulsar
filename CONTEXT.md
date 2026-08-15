@@ -40,9 +40,13 @@ _Avoid_: Dropping, discarding (both imply lost bytes)
 The single row that evicted exited Process Rows roll their totals into, labelled "(evicted processes)". It owns no PID and no Flows: it is where attribution stops, and the only row that is never itself a candidate for Eviction.
 _Avoid_: Other, misc (both read as a category rather than as a memory bound)
 
+**Program**:
+The identity a set of Process Rows share, and the Ledger's top level: one executable, or one service inside a shared service host — and, for a row whose identity has not arrived, that row alone, since it has nothing yet to share. It exists so eight instances of a terminal are one row that holds still rather than eight that re-sort against each other. It owns no PID and no Flows of its own: it carries its instances' sums, and is gone only when every one of them is.
+_Avoid_: App, application (both name the thing a user installed rather than the identity rows group by)
+
 **Process Row**:
-The top-level unit of display and aggregation — a monitored process, or a single service inside a shared service-host process.
-_Avoid_: App, program
+The unit of attribution and aggregation — a monitored process instance, or a single service inside a shared service-host process. In the Ledger it sits under its Program, and its Flows sit under it.
+_Avoid_: App
 
 **Attribution**:
 Binding a flow to the process (or service) that owns it.
@@ -67,11 +71,11 @@ How hard the Engine is being read, and the only thing it knows about the world o
 _Avoid_: Mode, state (both already mean too many things here)
 
 **Ledger**:
-zPulsar's main window: one dense, sortable table of Process Rows over a status bar, each Process Row expanding in place to show its Flows. Its row order is *frozen* between periodic re-sorts, so rows sit still while the numbers inside them move.
+zPulsar's main window: one dense, sortable table over a status bar, three levels deep — Programs, the Process Rows that are instances of them, and a row's Flows. Its order is *frozen* between periodic re-sorts — Programs among themselves, and instances within their Program, on one shared beat — so rows sit still while the numbers inside them move.
 _Avoid_: Grid, list (both name the widget rather than what it shows)
 
 **Info View**:
-The Ledger's right-hand dock: one panel describing whatever is selected — a Process Row, or one of its Flows — in collapsible sections, ending in a Tools section of reserved entries that v1 renders inert. It shows what the held Snapshot already carries and asks the Engine for nothing; a field the Snapshot cannot fill is absent or says so, never blank.
+The Ledger's right-hand dock: one panel describing whatever is selected — a Program, a Process Row, or one of its Flows — in collapsible sections, ending in a Tools section of reserved entries that v1 renders inert. It shows what the held Snapshot already carries and asks the Engine for nothing; a field the Snapshot cannot fill is absent or says so, never blank.
 _Avoid_: Details pane, sidebar, properties panel, inspector (the last named a whole rejected layout — see issue #10)
 
 **Tray-idle**:

@@ -68,17 +68,20 @@ const col_up = columnOf(.up);
 const col_down_total = columnOf(.down_total);
 const col_up_total = columnOf(.up_total);
 
-/// How far a Flow's line is indented under its Process Row — past the
-/// chevron and the badge, so the protocol tags line up in a column of their
-/// own.
-const flow_indent = 26;
+/// How far each level is indented under the one above it. A Flow sits two
+/// levels down — under its instance, under its Program — so its protocol tags
+/// line up in a column of their own, clear of both chevrons.
+const indent_step = 16;
+const flow_indent = indent_step * 2;
 
 pub const Ledger = struct {
+    grouped: view.programs.Programs = .{},
     ordering: order.Ordering = .{},
     table: view.table.Table = .{},
     info: info_view.InfoView = .{},
 
     pub fn deinit(self: *Ledger, gpa: std.mem.Allocator) void {
+        self.grouped.deinit(gpa);
         self.ordering.deinit(gpa);
         self.table.deinit(gpa);
     }
@@ -94,6 +97,11 @@ pub const Ledger = struct {
         var vbox = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
         defer vbox.deinit();
 
+        // Both halves of the window are drawn from the same Programs — the
+        // table lists them, the panel describes the selected one — so they are
+        // grouped once, here, and handed to both.
+        const list = self.grouped.build(gpa, snap.rows);
+
         {
             var split = dvui.box(@src(), .{ .dir = .horizontal }, .{
                 .expand = .both,
@@ -104,11 +112,11 @@ pub const Ledger = struct {
             });
             defer split.deinit();
 
-            self.tablePane(gpa, snap, now_ms);
+            self.tablePane(gpa, snap, list, now_ms);
             _ = dvui.separator(@src(), .{ .expand = .vertical });
             // Drawn after the table, so it shows the selection this frame's
             // click just made rather than the one before it.
-            self.info.frame(snap, self.table.inspected());
+            self.info.frame(snap, list, self.table.inspected());
         }
 
         statusBar(snap);
@@ -118,10 +126,13 @@ pub const Ledger = struct {
         self: *Ledger,
         gpa: std.mem.Allocator,
         snap: *const snapshot.Snapshot,
+        list: []view.programs.Program,
         now_ms: u64,
     ) void {
-        const display = self.ordering.display(gpa, snap.rows, now_ms);
-        const lines = self.table.build(gpa, snap, display);
+        // Order both levels on the frozen beat, then lay the lines out under
+        // whatever the user has opened.
+        const display = self.ordering.display(gpa, list, snap.rows, now_ms);
+        const lines = self.table.build(gpa, snap, list, display);
 
         var grid: dvui.GridWidget = undefined;
         grid.init(@src(), .{ .rows = lines.len }, .{
@@ -160,13 +171,13 @@ pub const Ledger = struct {
         // that was hit.
         if (grid.cellActivated()) |activated| {
             if (activated.cell.row < lines.len)
-                self.table.click(gpa, snap, lines[activated.cell.row]);
+                self.table.click(gpa, snap, list, lines[activated.cell.row]);
         }
         const hovered = grid.cellHovered();
 
         for (first..last) |row| {
             if (row >= lines.len) break;
-            self.cells(&grid, row, lines[row], snap, hovered);
+            self.cells(&grid, row, lines[row], snap, list, hovered);
         }
     }
 
@@ -222,15 +233,16 @@ pub const Ledger = struct {
         self.ordering.sortBy(field, direction);
     }
 
-    /// One line, Process Row or Flow. The two decisions that belong to the
-    /// whole line — what fills it and what colour its text takes — are made
-    /// here, once, and carried into every cell by the Pen.
+    /// One line, at whichever of the three levels it sits. The two decisions
+    /// that belong to the whole line — what fills it and what colour its text
+    /// takes — are made here, once, and carried into every cell by the Pen.
     fn cells(
         self: *Ledger,
         grid: *dvui.GridWidget,
         row: usize,
         line: view.table.Line,
         snap: *const snapshot.Snapshot,
+        list: []const view.programs.Program,
         hovered: ?dvui.GridWidget.Cell,
     ) void {
         var fill: ?dvui.Color = null;
@@ -241,7 +253,21 @@ pub const Ledger = struct {
         // the cursor wanders over the others.
         if (self.table.isSelected(line)) fill = style.selection;
 
-        const r = snap.rows[line.row];
+        const row_idx = line.row orelse {
+            const program = list[line.program];
+            // A Program is gone only once every instance of it is; until then
+            // it reads as running, however many of its instances have exited.
+            const pen: Pen = .{
+                .grid = grid,
+                .row = row,
+                .fill = fill,
+                .text = if (program.exited) style.dim else null,
+            };
+            programCells(pen, program, snap.rows[program.represents], self.table.isProgramExpanded(program));
+            return;
+        };
+
+        const r = snap.rows[row_idx];
         if (line.flow) |flow_idx| {
             const f = r.flows[flow_idx];
             // A Lingering Flow is a closed conversation still on screen
@@ -322,6 +348,67 @@ const Pen = struct {
     }
 };
 
+/// The Ledger's top level: the Program, carrying its instances' sums and the
+/// identity they share (issue #47).
+fn programCells(pen: Pen, p: view.programs.Program, r: snapshot.Row, expanded: bool) void {
+    programCell(pen, p, r, expanded);
+    {
+        var cell = pen.cell(col_pid);
+        defer cell.deinit();
+        // A Program owns no PID: it is not one process, and showing one of its
+        // instances' PIDs would be a lie about which.
+        dvui.label(@src(), "{s}", .{format.idle}, numberOpts(style.dim));
+    }
+
+    pen.rate(col_down, p.recv_rate, .down);
+    pen.rate(col_up, p.sent_rate, .up);
+    pen.volume(col_down_total, view.programs.volume(p, .down));
+    pen.volume(col_up_total, view.programs.volume(p, .up));
+}
+
+fn programCell(pen: Pen, p: view.programs.Program, r: snapshot.Row, expanded: bool) void {
+    var cell = pen.cell(col_process);
+    defer cell.deinit();
+    var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+    defer hbox.deinit();
+
+    chevron(expanded, true);
+    processBadge(r);
+    dvui.label(@src(), "{s}", .{format.processName(r.name)}, .{
+        .gravity_y = 0.5,
+        .color_text = pen.text,
+    });
+    // Service Attribution (CONTEXT.md): a Program that grouped by its service
+    // *is* that service, so the name of it belongs on this row. Several
+    // services means a shared host that could not be split, and the honest
+    // fallback names the count rather than picking one.
+    if (r.services.len == 1) {
+        dvui.label(@src(), "· {s}", .{r.services[0]}, .{ .gravity_y = 0.5, .color_text = style.dim });
+    } else if (r.services.len > 1) {
+        dvui.label(@src(), "· {d} services", .{r.services.len}, .{ .gravity_y = 0.5, .color_text = style.dim });
+    }
+    // How many instances are running, when it is more than the one — the
+    // number this row exists to keep off the top level.
+    if (p.members.len > 1) {
+        dvui.label(@src(), "×{d}", .{p.members.len}, .{
+            .gravity_y = 0.5,
+            .color_text = style.dim,
+            .font = style.caption(),
+        });
+    }
+    if (p.flows > 0) {
+        dvui.label(@src(), "({d})", .{p.flows}, .{
+            .gravity_y = 0.5,
+            .color_text = style.dim,
+            .font = style.caption(),
+        });
+    }
+    // The Evicted-processes Row is not a program that exited — it is where
+    // attribution stops (CONTEXT.md), and it says that in its own name.
+    if (p.exited and !r.evicted_processes)
+        dvui.label(@src(), "(exited)", .{}, .{ .gravity_y = 0.5, .color_text = style.dim });
+}
+
 fn processCells(pen: Pen, r: snapshot.Row, expanded: bool) void {
     processCell(pen, r, expanded);
     {
@@ -341,38 +428,32 @@ fn processCells(pen: Pen, r: snapshot.Row, expanded: bool) void {
     pen.volume(col_up_total, format.rowVolume(r, .up));
 }
 
+/// One instance of a Program. Its name is on the row above it, so this line
+/// says what it *is* — a process — and leaves the PID to the PID column
+/// rather than printing the same number twice.
 fn processCell(pen: Pen, r: snapshot.Row, expanded: bool) void {
     var cell = pen.cell(col_process);
     defer cell.deinit();
     var hbox = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
     defer hbox.deinit();
 
-    // A row with no Flows has nothing to open, and says so by not offering.
-    // The space stays either way, so the names stay in one column.
-    if (r.flows.len > 0)
-        dvui.icon(@src(), "expand", if (expanded)
-            dvui.entypo.triangle_down
-        else
-            dvui.entypo.triangle_right, .{}, .{
-            .gravity_y = 0.5,
-            .min_size_content = .{ .w = 10, .h = 10 },
-            .color_text = style.dim,
-        })
-    else
-        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 10 } });
-
-    processBadge(r);
-    dvui.label(@src(), "{s}", .{format.processName(r.name)}, .{
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = indent_step } });
+    chevron(expanded, r.flows.len > 0);
+    dvui.label(@src(), "Process", .{}, .{
         .gravity_y = 0.5,
-        .color_text = pen.text,
+        .color_text = pen.text orelse style.dim,
+        .font = style.caption(),
     });
-    // Service Attribution (CONTEXT.md): one service means the row *is* that
-    // service; several mean a shared host, and the honest fallback names the
-    // count rather than picking one.
-    if (r.services.len == 1) {
-        dvui.label(@src(), "· {s}", .{r.services[0]}, .{ .gravity_y = 0.5, .color_text = style.dim });
-    } else if (r.services.len > 1) {
-        dvui.label(@src(), "· {d} services", .{r.services.len}, .{ .gravity_y = 0.5, .color_text = style.dim });
+    // A shared host that could not be split runs several services, and every
+    // such instance grouped under the one executable — so the Program row
+    // above can only name one of them. Each instance says what it is hosting,
+    // or the others' services would appear nowhere in the table (issue #25).
+    if (r.services.len > 1) {
+        dvui.label(@src(), "· {d} services", .{r.services.len}, .{
+            .gravity_y = 0.5,
+            .color_text = style.dim,
+            .font = style.caption(),
+        });
     }
     if (r.flows.len > 0) {
         dvui.label(@src(), "({d})", .{r.flows.len}, .{
@@ -383,6 +464,24 @@ fn processCell(pen: Pen, r: snapshot.Row, expanded: bool) void {
     }
     if (r.exited and !r.evicted_processes)
         dvui.label(@src(), "(exited)", .{}, .{ .gravity_y = 0.5, .color_text = style.dim });
+}
+
+/// The open/closed marker. A line with nothing under it has nothing to open,
+/// and says so by not offering — the space stays either way, so what follows
+/// stays in one column.
+fn chevron(expanded: bool, has_children: bool) void {
+    if (!has_children) {
+        _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 10 } });
+        return;
+    }
+    dvui.icon(@src(), "expand", if (expanded)
+        dvui.entypo.triangle_down
+    else
+        dvui.entypo.triangle_right, .{}, .{
+        .gravity_y = 0.5,
+        .min_size_content = .{ .w = 10, .h = 10 },
+        .color_text = style.dim,
+    });
 }
 
 fn flowCells(pen: Pen, f: snapshot.Flow) void {

@@ -36,11 +36,12 @@ pub const InfoView = struct {
     activity_open: bool = true,
     tools_open: bool = true,
 
-    /// One frame. `inspected` must have come from the same Snapshot — it
-    /// indexes into it.
+    /// One frame. `inspected` must have come from the same Snapshot and the
+    /// same Program list — it indexes into both.
     pub fn frame(
         self: *InfoView,
         snap: *const snapshot.Snapshot,
+        list: []const view.programs.Program,
         inspected: view.table.Inspected,
     ) void {
         var panel = dvui.box(@src(), .{ .dir = .vertical }, .{
@@ -67,12 +68,38 @@ pub const InfoView = struct {
                 .gravity_x = 0.5,
                 .padding = .{ .x = 0, .y = 30, .w = 0, .h = 0 },
             }),
+            .program => |at| {
+                const p = list[at];
+                self.program(p, snap.rows[p.represents]);
+            },
             .process => |row| self.process(snap.rows[row]),
             .flow => |sel| {
                 const row = snap.rows[sel.row];
                 self.flow(row, row.flows[sel.flow]);
             },
         }
+    }
+
+    fn program(self: *InfoView, p: view.programs.Program, r: snapshot.Row) void {
+        dvui.label(@src(), "Program", .{}, .{ .color_text = style.accent, .font = style.title() });
+        dvui.label(@src(), "{s}", .{format.processName(r.name)}, .{ .font = style.captionHeading() });
+        if (p.members.len > 1)
+            dvui.label(@src(), "{d} instances", .{p.members.len}, subtitleOpts())
+        else if (r.services.len == 1)
+            dvui.label(@src(), "{s}", .{r.services[0]}, subtitleOpts());
+
+        var fields: info.Fields = .{};
+        info.programProperties(&fields, p, r);
+        if (dvui.expander(@src(), "Program properties", .{ .expanded = &self.properties_open }, sectionOpts()))
+            fieldList(@src(), &fields);
+
+        var activity: info.Fields = .{};
+        info.programActivity(&activity, p);
+        if (dvui.expander(@src(), "Activity", .{ .expanded = &self.activity_open }, sectionOpts()))
+            fieldList(@src(), &activity);
+
+        if (dvui.expander(@src(), "Tools", .{ .expanded = &self.tools_open }, sectionOpts()))
+            tools(@src(), &info.process_tools);
     }
 
     fn process(self: *InfoView, r: snapshot.Row) void {

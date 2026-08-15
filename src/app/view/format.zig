@@ -127,21 +127,34 @@ pub fn flowVolume(f: snapshot.Flow, dir: Direction) Volume {
 /// bytes it kept — Eviction coarsens attribution and the Row carries no
 /// message counter of its own (CONTEXT.md "Eviction").
 pub fn rowVolume(r: snapshot.Row, dir: Direction) Volume {
-    if (r.recv == 0 and r.sent == 0) {
-        var recv: u64 = 0;
-        var sent: u64 = 0;
-        for (r.flows) |f| {
-            recv += f.msgs_recv;
-            sent += f.msgs_sent;
-        }
-        if (recv != 0 or sent != 0) return .{ .msgs = switch (dir) {
-            .down => recv,
-            .up => sent,
+    // The common row has bytes and is answered without touching its Flows.
+    // Worth the early return: the Ledger sorts on this, so it runs once per
+    // comparison on the re-sort beat, and walking every Flow of every row to
+    // reach a foregone conclusion is how an idle machine loses its CPU budget.
+    if (r.recv != 0 or r.sent != 0) return volumeOf(r.recv, r.sent, 0, 0, dir);
+
+    var msgs_recv: u64 = 0;
+    var msgs_sent: u64 = 0;
+    for (r.flows) |f| {
+        msgs_recv += f.msgs_recv;
+        msgs_sent += f.msgs_sent;
+    }
+    return volumeOf(0, 0, msgs_recv, msgs_sent, dir);
+}
+
+/// The rule itself, over numbers from wherever they were summed — one row's,
+/// or a whole Program's (programs.zig). One place, so the two levels of the
+/// Ledger cannot disagree about what a totals cell means.
+pub fn volumeOf(recv: u64, sent: u64, msgs_recv: u64, msgs_sent: u64, dir: Direction) Volume {
+    if (recv == 0 and sent == 0 and (msgs_recv != 0 or msgs_sent != 0)) {
+        return .{ .msgs = switch (dir) {
+            .down => msgs_recv,
+            .up => msgs_sent,
         } };
     }
     return .{ .bytes = switch (dir) {
-        .down => r.recv,
-        .up => r.sent,
+        .down => recv,
+        .up => sent,
     } };
 }
 
