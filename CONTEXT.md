@@ -67,8 +67,12 @@ How hard the Engine is being read, and the only thing it knows about the world o
 _Avoid_: Mode, state (both already mean too many things here)
 
 **Ledger**:
-zPulsar's main window: one dense, sortable table of Process Rows over a status bar. Its row order is *frozen* between periodic re-sorts, so rows sit still while the numbers inside them move.
+zPulsar's main window: one dense, sortable table of Process Rows over a status bar, each Process Row expanding in place to show its Flows. Its row order is *frozen* between periodic re-sorts, so rows sit still while the numbers inside them move.
 _Avoid_: Grid, list (both name the widget rather than what it shows)
+
+**Info View**:
+The Ledger's right-hand dock: one panel describing whatever is selected — a Process Row, or one of its Flows — in collapsible sections, ending in a Tools section of reserved entries that v1 renders inert. It shows what the held Snapshot already carries and asks the Engine for nothing; a field the Snapshot cannot fill is absent or says so, never blank.
+_Avoid_: Details pane, sidebar, properties panel, inspector (the last named a whole rejected layout — see issue #10)
 
 **Tray-idle**:
 The state where the main window is closed and only the tray icon remains: monitoring continues in full, footprint drops to the minimum.
