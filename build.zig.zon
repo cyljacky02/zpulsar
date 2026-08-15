@@ -8,10 +8,18 @@
             .url = "git+https://github.com/marlersoft/zigwin32#9f15c276b4e9d05afd34a10d8662a7dfc34647ea",
             .hash = "win32-42.0.39-preview-mX5pFS564gPTezZn4v3TMxRnfJUrZNx1B_F2p2HKXOeG",
         },
+        // The GUI, pinned to the commit docs/research/gui-library-viability.md
+        // measured (dx11 backend, attach mode). Pre-1.0 and breaking between
+        // releases — upgrades are deliberate, never a floating ref.
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui#7c597c5564c3f55cdb876f5ea5a55bb7120cdef9",
+            .hash = "dvui-0.5.0-dev-AQFJmYBGAQFhUuXUS0U7WFjJ08PUmNUhuzUVr7x7JPZK",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "zpulsar.manifest",
     },
 }

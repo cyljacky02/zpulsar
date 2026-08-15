@@ -62,6 +62,14 @@ _Avoid_: Reverse DNS (that's a fallback, not the mechanism)
 A remote name nobody was observed resolving: read from the machine's resolver cache at startup, for names resolved before zPulsar existed, or from a reverse lookup after that. A Hint says an address *was* resolved under a name, never by whom — so it renders dimmed behind its source's marker, and never displaces an observation.
 _Avoid_: Guess (a Hint is evidence, just not attributable), fallback name
 
+**Posture**:
+How hard the Engine is being read, and the only thing it knows about the world outside itself: window-open pays for the Attribution Latency budget, Tray-idle drops to the ETW session's own 1 s flush and ~1 s Snapshots. Named for the reader's state, never for the reader — the Engine has no idea a window exists.
+_Avoid_: Mode, state (both already mean too many things here)
+
+**Ledger**:
+zPulsar's main window: one dense, sortable table of Process Rows over a status bar. Its row order is *frozen* between periodic re-sorts, so rows sit still while the numbers inside them move.
+_Avoid_: Grid, list (both name the widget rather than what it shows)
+
 **Tray-idle**:
 The state where the main window is closed and only the tray icon remains: monitoring continues in full, footprint drops to the minimum.
 _Avoid_: Background mode, minimized

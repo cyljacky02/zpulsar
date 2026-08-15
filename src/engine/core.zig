@@ -967,6 +967,7 @@ pub const Core = struct {
             const speed = row.rate.speed(event_now_ms);
             dst.* = .{
                 .pid = row.pid,
+                .create_time = row.create_time,
                 .name = try snapshot.arenaDupe(snap, row.name),
                 .exited = row.exited,
                 .evicted_processes = row.evicted_processes,
@@ -1290,6 +1291,28 @@ test "exit marks the row with totals intact; a reused PID gets a fresh row" {
     try std.testing.expect(!snap2.rows[1].exited);
     try std.testing.expectEqualStrings("\\x\\b.exe", snap2.rows[1].name);
     try std.testing.expectEqual(@as(u64, 11), snap2.rows[1].sent);
+}
+
+test "a Snapshot row carries the row key, so a reader can follow it across Snapshots" {
+    var core = Core.init(std.testing.allocator);
+    defer core.deinit();
+    try core.applyProcess(procEvent(.start, 100, 111, 0, "\\x\\a.exe"), 0);
+    try core.applyProcess(procEvent(.stop, 100, 111, 200, ""), 0);
+    try core.applyProcess(procEvent(.start, 100, 500, 0, "\\x\\b.exe"), 0);
+
+    const snap = try core.buildSnapshot(0);
+    defer snap.release();
+    // Same PID, two instances: only the CreateTime tells them apart, which is
+    // what a reader holding an ordering across Snapshots has to key on.
+    try std.testing.expectEqual(@as(usize, 2), snap.rows.len);
+    try std.testing.expectEqual(@as(u64, 111), snap.rows[0].create_time);
+    try std.testing.expectEqual(@as(u64, 500), snap.rows[1].create_time);
+
+    // And it is stable: the next Snapshot names the same instances the same way.
+    const snap2 = try core.buildSnapshot(0);
+    defer snap2.release();
+    try std.testing.expectEqual(@as(u64, 111), snap2.rows[0].create_time);
+    try std.testing.expectEqual(@as(u64, 500), snap2.rows[1].create_time);
 }
 
 test "traffic just after exit attributes to the exited row, never a fresh one" {
