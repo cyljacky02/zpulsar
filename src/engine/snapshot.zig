@@ -76,6 +76,14 @@ pub const Flow = struct {
 /// so several rows may share a PID (at most one of them live).
 pub const Row = struct {
     pid: u32,
+    /// The other half of the row key: the process instance's raw payload
+    /// CreateTime FILETIME. With `pid` it names one process instance for the
+    /// whole session — the only thing that tells two rows sharing a reused PID
+    /// apart, and so the handle a reader keeps when it wants to follow a row
+    /// across Snapshots (the Ledger's frozen ordering does). Zero on a
+    /// placeholder row whose identity has not arrived yet, and on the
+    /// Evicted-processes Row, which is no instance at all.
+    create_time: u64 = 0,
     /// Display image path (drive-letter converted; bare name for
     /// kernel/minimal processes). Empty until a start/rundown event names
     /// the process. Arena-owned by this Snapshot.

@@ -27,11 +27,54 @@ pub const sweep_interval_ms: u64 = 10_000;
 /// EventsLost is polled at ~1 s — losses are rare and the query costs a
 /// control-path call. This is a superset of the sweep's check-loss duty
 /// (spec: "the sweep also checks for event loss"), and the loss re-baseline
-/// runs the same table reconcile the sweep does.
-const loss_check_every_ticks: u32 = 8;
+/// runs the same table reconcile the sweep does. Wall time, not tick counts:
+/// the tick cadence changes with the posture, loss does not.
+const loss_check_interval_ms: u64 = 1_000;
 /// Publishing is cheap but allocates an arena; bound it below the flush
 /// cadence so a trickle byte still surfaces within the latency budget.
 const min_publish_interval_ms: u64 = 50;
+/// Tray-idle's cadence — the session's own FlushTimer period
+/// (etw_session.buildProperties). Nothing is reading faster than this while
+/// the window is gone, so nothing needs to run faster.
+pub const tray_idle_interval_ms: u64 = 1_000;
+
+/// How hard the Engine is being read (ADR-0002; CONTEXT.md "Posture"). The
+/// < 200 ms Attribution Latency budget applies window-open; Tray-idle is the
+/// state where nothing reads a Snapshot faster than the tray tooltip's 1 s
+/// beat, so nothing here needs to run faster either.
+///
+/// This is the whole of what the Engine knows about the world outside itself:
+/// two names for how often it is being asked, and no notion of what is asking.
+///
+/// Explicitly tagged: it is read through an atomic, and an inferred tag type
+/// has no representation to be atomic about.
+pub const Posture = enum(u8) { window_open, tray_idle };
+
+/// A posture's price per second: how often the maintenance tick runs, whether
+/// the manual ETW flush rides that tick, and how often a dirty Core may
+/// publish a Snapshot.
+pub const Cadence = struct {
+    tick_ms: u64,
+    /// Tray-idle suspends the manual flush entirely and rides the session's
+    /// 1 s FlushTimer — that is where most of the idle CPU saving is.
+    manual_flush: bool,
+    publish_ms: u64,
+
+    pub fn of(posture: Posture) Cadence {
+        return switch (posture) {
+            .window_open => .{
+                .tick_ms = flush_interval_ms,
+                .manual_flush = true,
+                .publish_ms = min_publish_interval_ms,
+            },
+            .tray_idle => .{
+                .tick_ms = tray_idle_interval_ms,
+                .manual_flush = false,
+                .publish_ms = tray_idle_interval_ms,
+            },
+        };
+    }
+};
 /// ADR-0002: shutdown may abandon a stuck resolver thread rather than hang
 /// behind a lookup that is documented as slow.
 const resolver_join_timeout_ms: u32 = 2_000;
@@ -63,6 +106,10 @@ pub const Engine = struct {
     published: snapshot.Published,
     ring_wake: sync.WakeEvent,
     stop_requested: std.atomic.Value(bool) = .init(false),
+    /// Set by whoever owns the window (any thread), read by the Engine thread.
+    /// Starts window-open: a reader that never says otherwise — the headless
+    /// rig — gets the full-rate posture it is built to exercise.
+    posture: std.atomic.Value(Posture) = .init(.window_open),
     /// Records lost to allocation failure inside the Engine thread; counted
     /// into the ring-loss signal so they trigger the same recovery.
     oom_drops: u64 = 0,
@@ -271,14 +318,25 @@ pub const Engine = struct {
         return self.published.wake;
     }
 
+    /// Reader API (any thread): say what the Engine is feeding. Going
+    /// Tray-idle drops it to the session's own 1 s FlushTimer and ~1 s
+    /// Snapshots; coming back window-open restores the latency budget. The
+    /// wake makes the change land now rather than at the end of the current
+    /// wait — which, leaving Tray-idle, is up to a second away.
+    pub fn setPosture(self: *Engine, posture: Posture) void {
+        self.posture.store(posture, .release);
+        self.ring_wake.set();
+    }
+
     fn engineMain(self: *Engine) void {
         const t0 = win32.GetTickCount64();
-        var last_flush: u64 = 0;
+        var last_tick: u64 = 0;
         var last_publish: u64 = 0;
         var last_sweep: u64 = 0;
-        var ticks: u32 = 0;
+        var last_loss_check: u64 = 0;
 
         while (!self.stop_requested.load(.acquire)) {
+            const cadence: Cadence = .of(self.posture.load(.acquire));
             const drain_now = win32.GetTickCount64() - t0;
             // Metadata first: a service map or owner-module answer applied
             // before this pass's traffic means the Flows it opens are
@@ -314,18 +372,19 @@ pub const Engine = struct {
             self.core.submitOutbox(self.lane);
 
             const now = win32.GetTickCount64() - t0;
-            if (now - last_flush >= flush_interval_ms) {
-                last_flush = now;
-                self.session.flush();
-                ticks +%= 1;
-                if (ticks % loss_check_every_ticks == 0) {
+            if (now - last_tick >= cadence.tick_ms) {
+                last_tick = now;
+                // Tray-idle rides the session's FlushTimer instead.
+                if (cadence.manual_flush) self.session.flush();
+                if (now - last_loss_check >= loss_check_interval_ms) {
+                    last_loss_check = now;
                     if (self.session.queryEventsLost()) |lost| self.events_lost = lost;
                 }
                 const ring_loss = self.ring.droppedTotal() + self.process_ring.droppedTotal() +
                     self.oom_drops;
                 if (self.core.noteLoss(ring_loss, self.events_lost))
                     self.rebaseline(now);
-                // Flow lifecycle rides the flush tick: Linger expiry, UDP
+                // Flow lifecycle rides the maintenance tick: Linger expiry, UDP
                 // age-out, and the memory caps. OOM leaves the state
                 // unchanged; the next tick retries.
                 self.core.tick(now) catch {};
@@ -335,7 +394,7 @@ pub const Engine = struct {
                 }
             }
 
-            if (self.core.dirty and now - last_publish >= min_publish_interval_ms) {
+            if (self.core.dirty and now - last_publish >= cadence.publish_ms) {
                 // Speeds are read on the clock the events were stamped with,
                 // not this loop's monotonic tick (rates.zig).
                 const event_now = rates.msFromFileTime(win32.systemTimeAsFileTime());
@@ -346,12 +405,12 @@ pub const Engine = struct {
             }
 
             const now2 = win32.GetTickCount64() - t0;
-            var wait_ms = flush_interval_ms -| (now2 -| last_flush);
-            // Unpublished state must not sleep through the flush interval —
+            var wait_ms = cadence.tick_ms -| (now2 -| last_tick);
+            // Unpublished state must not sleep through the tick interval —
             // wake as soon as the publish throttle reopens, or the trickle
             // path busts the 200 ms budget.
             if (self.core.dirty)
-                wait_ms = @min(wait_ms, min_publish_interval_ms -| (now2 -| last_publish));
+                wait_ms = @min(wait_ms, cadence.publish_ms -| (now2 -| last_publish));
             if (wait_ms > 0 and self.ring.isEmpty())
                 _ = self.ring_wake.timedWait(@intCast(wait_ms));
         }
@@ -392,3 +451,28 @@ pub const Engine = struct {
         self.core.rebaseline(rows, now_ms) catch self.core.flagRebaselined();
     }
 };
+
+test "window-open pays for the latency budget: manual flush, sub-tick publishes" {
+    const c: Cadence = .of(.window_open);
+    try std.testing.expect(c.manual_flush);
+    try std.testing.expectEqual(flush_interval_ms, c.tick_ms);
+    // Delivery (≤ ~120 ms) plus publish has to fit the 200 ms budget, so the
+    // publish throttle stays well under the tick.
+    try std.testing.expect(c.publish_ms < c.tick_ms);
+    try std.testing.expect(c.tick_ms + c.publish_ms <= 200);
+}
+
+test "Tray-idle suspends the manual flush and rides the session's FlushTimer" {
+    const c: Cadence = .of(.tray_idle);
+    // The saving is the flush call itself: nothing is reading faster than the
+    // 1 s FlushTimer the session already runs (etw_session.buildProperties).
+    try std.testing.expect(!c.manual_flush);
+    try std.testing.expectEqual(@as(u64, 1_000), c.tick_ms);
+    try std.testing.expectEqual(@as(u64, 1_000), c.publish_ms);
+
+    // And it is strictly cheaper than window-open on every axis — otherwise
+    // closing the window would buy nothing.
+    const open: Cadence = .of(.window_open);
+    try std.testing.expect(c.tick_ms > open.tick_ms);
+    try std.testing.expect(c.publish_ms > open.publish_ms);
+}

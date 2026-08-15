@@ -107,3 +107,54 @@ Adopt dvui pinned to a known-good master commit (≥ `7c597c5`), dx11 backend in
 `-Dtree-sitter=false` `-Dtiny-file-dialogs=false`, ReleaseSmall for dist. First spike should
 exercise the one thing not yet proven end-to-end: a full window+device teardown → tray-only →
 recreate cycle in one process.
+
+## Addendum — what the teardown cycle cost (issue #24, 2026-08-15)
+
+The recommendation above held: dvui at the pinned `7c597c5` builds the real app shell, and the
+teardown → Tray-idle → recreate cycle works in one process.
+
+Method, so this is repeatable: launch `zig-out/bin/zpulsar.exe`, find its windows by class name
+(`zPulsarMainWindow`, `zPulsarTrayWindow`) with `EnumWindows` — `FindWindow` from .NET/PowerShell
+does not see them — then drive a cycle by posting `WM_CLOSE` to the main window and launching a
+second instance to trigger the tray hand-off that restores it, sampling
+`Process.WorkingSet64`/`HandleCount`/`Threads.Count` and the `Private Bytes` counter at each
+Tray-idle and window-open point. `WM_ENDSESSION` (wparam 1) to the tray window exercises the
+session-end exit; `WM_QUIT` posted to its thread exercises the tray-menu exit. Note that
+`logman query -ets` intermittently fails with 0x800710E8, so retry before believing it when
+checking whether `zPulsarNet` is up.
+
+Measured on the ReleaseSmall build, six consecutive cycles, hardware D3D11:
+
+| | window open | Tray-idle |
+|---|---|---|
+| Working set | ~58 MB | ~35 MB |
+| Private bytes | ~135 MB | ~90 MB |
+| Handles | 651 | 272 |
+| Threads | 113 | 10 |
+
+Flat across all six cycles — every recreate returns to the same numbers. Exe: **2,181,632 B**
+ReleaseSmall, consistent with the 1.92 MB floor measured above.
+
+But two pre-1.0 dvui defects sit directly on that path, and both are worked around in
+`src/app/window.zig`. Neither is reachable by an app that creates one device and exits, which
+is presumably why they survive upstream:
+
+- **`createSampler` leaks an `ID3D11BlendState` per window** (`src/backends/dx11.zig`). It
+  builds a blend state on every call and overwrites the previous one without releasing it, and
+  it runs twice per window — once per texture interpolation. One stranded device child keeps
+  the whole `ID3D11Device` alive, so *nothing* is reclaimed on teardown: measured at +103
+  threads, +364 handles and +27 MB private **per cycle**, none of it returned. Confirmed by
+  refcount probe (the device sat at 1 reference after `WindowState.deinit`) and isolated by
+  bisect (a bare create/destroy of window + device with dvui out of the loop reached 0 refs and
+  leaked nothing). Worked around by supplying the nearest sampler ourselves so dvui's creation
+  path runs once instead of twice; the device then reaches 0 references and the table above is
+  what teardown actually returns.
+- **Zero-repeat key messages panic the backend**, the pitfall the UI prototype recorded:
+  `for (1..info.repeat_count)` underflows when a synthetic `WM_KEYDOWN`/`WM_KEYUP` carries a
+  zero repeat count. Real keyboards never send one. The app's wndproc normalizes the count to
+  at least 1 before forwarding.
+
+One layout note, not a defect: `GridWidget` reports the height it was given as its own minimum,
+which is self-fulfilling inside a vertical box — the box then has nothing left for a status bar
+under it and pushes it off the window. `.max_size_content = .height(0)` on the grid is dvui's
+own lever for this (`WidgetData.minSizeSetAndRefresh` clamps the reported minimum).
